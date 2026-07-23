@@ -393,10 +393,29 @@ def build_segments(df):
                 'Дата прибытия': arrival_date.strftime('%d.%m.%Y') if pd.notna(arrival_date) else None,
                 'Дата выбытия': departure_date.strftime('%d.%m.%Y') if pd.notna(departure_date) else None,
                 'Дней в локации': days_in_location,
+                # временные "сырые" даты для последующего расчёта "Дней между локациями" по всей таблице
+                '_Дата прибытия (raw)': arrival_date,
+                '_Дата выбытия (raw)': departure_date,
             })
 
     print(f"    Отрезков построено: {len(rows):,}")
-    return pd.DataFrame(rows)
+
+    segments_df = pd.DataFrame(rows)
+    if segments_df.empty:
+        return segments_df
+
+    # Дней между локациями: дата прибытия СЛЕДУЮЩЕЙ строки (следующего отрезка)
+    # минус дата выбытия ТЕКУЩЕЙ строки, для одного и того же КТК (сквозняком, без привязки к кругу —
+    # т.к. переход из последнего отрезка одного круга в первый отрезок следующего круга тоже занимает время)
+    segments_df['_next_arrival_raw'] = segments_df.groupby('Номер КТК')['_Дата прибытия (raw)'].shift(-1)
+    mask = segments_df['_next_arrival_raw'].notna() & segments_df['_Дата выбытия (raw)'].notna()
+    segments_df['Дней между локациями'] = None
+    segments_df.loc[mask, 'Дней между локациями'] = (
+        segments_df.loc[mask, '_next_arrival_raw'] - segments_df.loc[mask, '_Дата выбытия (raw)']
+    ).dt.days
+
+    segments_df = segments_df.drop(columns=['_Дата прибытия (raw)', '_Дата выбытия (raw)', '_next_arrival_raw'])
+    return segments_df
 
 
 
