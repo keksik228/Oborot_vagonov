@@ -411,7 +411,8 @@ def build_segments(df):
     mask = segments_df['_next_arrival_raw'].notna() & segments_df['_Дата выбытия (raw)'].notna()
     segments_df['Дней между локациями'] = None
     segments_df.loc[mask, 'Дней между локациями'] = (
-        segments_df.loc[mask, '_next_arrival_raw'] - segments_df.loc[mask, '_Дата выбытия (raw)']
+        segments_df.loc[mask, '_next_arrival_raw'].dt.date -
+        segments_df.loc[mask, '_Дата выбытия (raw)'].dt.date
     ).dt.days
 
     segments_df = segments_df.drop(columns=['_Дата прибытия (raw)', '_Дата выбытия (raw)', '_next_arrival_raw'])
