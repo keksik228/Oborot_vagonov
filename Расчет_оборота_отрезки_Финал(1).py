@@ -286,7 +286,7 @@ def build_segments(df):
     """
     if 'Номер КТК' not in df.columns or 'Локация' not in df.columns:
         print("    ! build_segments: нет нужных колонок")
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
 
     # Работаем только по строкам внутри кругов
     df_circles = df[df['Номер круга'].notna()].copy()
@@ -294,15 +294,16 @@ def build_segments(df):
 
     if df_circles.empty:
         print("    ! build_segments: нет строк с кругами")
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
 
     # Приводим Номер круга к int
     df_circles['Номер круга'] = df_circles['Номер круга'].astype(int)
 
     rows = []
+    row_to_segment = {}  # исходный индекс строки (из df) -> текст "Отрезок" для листа "Обработанные данные"
 
     for (ktk, circle_num), grp in df_circles.groupby(['Номер КТК', 'Номер круга']):
-        grp = grp.sort_values('Дата события').reset_index(drop=True)
+        grp = grp.sort_values('Дата события')  # индекс НЕ сбрасываем - нужен для сопоставления с исходной таблицей
 
         # Получаем продукт и маршрут круга
         product = None
@@ -320,6 +321,8 @@ def build_segments(df):
         # Разбиваем на визиты с сохранением последнего события
         visits = []
         current_visit = None
+        current_visit_row_indices = []  # исходные индексы строк, входящих в текущий визит
+        visits_row_indices = []  # список списков индексов - по одному на каждый визит
 
         for idx, row in grp.iterrows():
             loc = row['Локация']
@@ -338,13 +341,16 @@ def build_segments(df):
                     'тип_движения': move_type,
                     'место_события': place
                 }
+                current_visit_row_indices = [idx]
             elif current_visit['локация'] == loc:
                 # Обновляем последнюю дату, тип движения и место события
                 current_visit['дата_выбытия'] = date
                 current_visit['тип_движения'] = move_type
                 current_visit['место_события'] = place
+                current_visit_row_indices.append(idx)
             else:
                 visits.append(current_visit)
+                visits_row_indices.append(current_visit_row_indices)
                 current_visit = {
                     'локация': loc,
                     'дата_прибытия': date,
@@ -352,9 +358,11 @@ def build_segments(df):
                     'тип_движения': move_type,
                     'место_события': place
                 }
+                current_visit_row_indices = [idx]
 
         if current_visit is not None:
             visits.append(current_visit)
+            visits_row_indices.append(current_visit_row_indices)
 
         # Строим отрезки
         for i in range(len(visits) - 1):
@@ -380,6 +388,8 @@ def build_segments(df):
             else:
                 days_in_location = None
 
+            segment_label = f"{loc_from} → {loc_to}"
+
             rows.append({
                 'Номер КТК': ktk,
                 'Номер круга': circle_num,
@@ -389,7 +399,7 @@ def build_segments(df):
                 'Место события': place,
                 'Локация откуда': loc_from,
                 'Локация куда': loc_to,
-                'Отрезок': f"{loc_from} → {loc_to}",
+                'Отрезок': segment_label,
                 'Дата прибытия': arrival_date.strftime('%d.%m.%Y') if pd.notna(arrival_date) else None,
                 'Дата выбытия': departure_date.strftime('%d.%m.%Y') if pd.notna(departure_date) else None,
                 'Дней в локации': days_in_location,
@@ -398,11 +408,21 @@ def build_segments(df):
                 '_Дата выбытия (raw)': departure_date,
             })
 
+            # Все исходные строки визита "ОТКУДА" относятся к этому отрезку
+            for row_idx in visits_row_indices[i]:
+                row_to_segment[row_idx] = segment_label
+
+            # Последний визит в круге ("КУДА" последнего отрезка) сам никогда не бывает "ОТКУДА",
+            # поэтому его строки относим к последнему отрезку (иначе они останутся без значения)
+            if i == len(visits) - 2:
+                for row_idx in visits_row_indices[i + 1]:
+                    row_to_segment[row_idx] = segment_label
+
     print(f"    Отрезков построено: {len(rows):,}")
 
     segments_df = pd.DataFrame(rows)
     if segments_df.empty:
-        return segments_df
+        return segments_df, row_to_segment
 
     # Дней между локациями: дата прибытия СЛЕДУЮЩЕЙ строки (следующего отрезка)
     # минус дата выбытия ТЕКУЩЕЙ строки, для одного и того же КТК (сквозняком, без привязки к кругу —
@@ -417,7 +437,7 @@ def build_segments(df):
     segments_df.loc[mask, 'Дней между локациями'] = (next_arrival_date_only - departure_date_only).dt.days
 
     segments_df = segments_df.drop(columns=['_Дата прибытия (raw)', '_Дата выбытия (raw)', '_next_arrival_raw'])
-    return segments_df
+    return segments_df, row_to_segment
 
 
 
@@ -435,6 +455,17 @@ def save_processed_data(df, output_folder):
     print(f"    Колонки df: {df.columns.tolist()[:6]}...")
     print(f"    'Номер КТК' в df: {'Номер КТК' in df.columns}")
 
+    # Строим отрезки маршрута один раз - используем и для листа "Отрезки маршрута",
+    # и для колонки "Отрезок" на листе "Обработанные данные"
+    print(f"    Строю отрезки маршрута...")
+    print(f"    Уникальных кругов в df: {df['Номер круга'].notna().sum():,} строк с кругом")
+    segments_df, row_to_segment = build_segments(df)
+
+    # Добавляем колонку "Отрезок" в df по исходному индексу строки
+    # (для строк вне кругов останется пусто - у них нет отрезка маршрута)
+    df = df.copy()
+    df['Отрезок'] = df.index.map(row_to_segment)
+
     # Порядок колонок как в образце
     desired_order = [
         'Номер КТК', 'Собственник', 'Типоразмер', 'Дата события',
@@ -444,7 +475,7 @@ def save_processed_data(df, output_folder):
         'Учетное направление', 'Перегруз',
         '№ события', 'Дней между событиями', 'Маршрут следования', 'Локация',
         'Flag_point', 'Номер круга', 'Отрезок_между_флагами', 'Вид расчета',
-        'Основной маршрут', 'Первая точка', 'Последняя точка', 'Продукт',
+        'Основной маршрут', 'Отрезок', 'Первая точка', 'Последняя точка', 'Продукт',
         'Проверка круга', 'Основной маршрут (общий)', 'Количество кругов'
     ]
     final_cols = [c for c in desired_order if c in df.columns]
@@ -459,9 +490,6 @@ def save_processed_data(df, output_folder):
         print(f"    ✓ Лист 'Обработанные данные' ({len(df_out):,} строк)")
 
         # Лист 2: Отрезки маршрута
-        print(f"    Строю отрезки маршрута...")
-        print(f"    Уникальных кругов в df: {df['Номер круга'].notna().sum():,} строк с кругом")
-        segments_df = build_segments(df)
         if not segments_df.empty:
             segments_df.to_excel(writer, sheet_name='Отрезки маршрута', index=False)
             print(f"    ✓ Лист 'Отрезки маршрута' ({len(segments_df):,} отрезков)")
@@ -531,7 +559,12 @@ def process_ktk_data():
     print("\n6. Нумерация событий и расчёт дней...")
     df = df.sort_values(['Номер КТК', 'Дата события']).reset_index(drop=True)
     df['№ события'] = df.groupby('Номер КТК').cumcount() + 1
-    df['Дней между событиями'] = df.groupby('Номер КТК')['Дата события'].diff().dt.days
+    # Считаем только по календарным датам, без времени внутри суток
+    # (иначе, например, 07.09 21:41 -> 09.09 01:50 даёт "1 день 4 часа", и .dt.days
+    # округляет вниз до 1, хотя по календарным датам это 2 дня)
+    df['Дней между событиями'] = df.groupby('Номер КТК')['Дата события'].transform(
+        lambda s: s.dt.normalize().diff().dt.days
+    )
     df['Дней между событиями'] = df['Дней между событиями'].fillna(0)
 
     print("\n7. Расчёт полного маршрута...")
