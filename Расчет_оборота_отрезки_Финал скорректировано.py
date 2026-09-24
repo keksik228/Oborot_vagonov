@@ -338,12 +338,14 @@ def build_segments(df):
                     'локация': loc,
                     'дата_прибытия': date,
                     'дата_выбытия': date,
-                    'тип_движения': move_type,
+                    'тип_движения_прибытия': move_type,  # тип ПЕРВОГО события визита (не перезаписывается)
+                    'тип_движения': move_type,  # тип ПОСЛЕДНЕГО события визита (выбытие)
                     'место_события': place
                 }
                 current_visit_row_indices = [idx]
             elif current_visit['локация'] == loc:
-                # Обновляем последнюю дату, тип движения и место события
+                # Обновляем последнюю дату, тип движения (выбытие) и место события.
+                # 'тип_движения_прибытия' НЕ трогаем - там должен остаться тип первого события визита
                 current_visit['дата_выбытия'] = date
                 current_visit['тип_движения'] = move_type
                 current_visit['место_события'] = place
@@ -355,6 +357,7 @@ def build_segments(df):
                     'локация': loc,
                     'дата_прибытия': date,
                     'дата_выбытия': date,
+                    'тип_движения_прибытия': move_type,
                     'тип_движения': move_type,
                     'место_события': place
                 }
@@ -375,7 +378,8 @@ def build_segments(df):
             # Данные из локации FROM (последнее событие)
             arrival_date = visit_from['дата_прибытия']
             departure_date = visit_from['дата_выбытия']
-            move_type = visit_from['тип_движения']
+            move_type = visit_from['тип_движения']  # тип выбытия (последнее событие визита)
+            move_type_arrival = visit_from['тип_движения_прибытия']  # тип прибытия (первое событие визита)
             place = visit_from['место_события']
 
             # Рассчитываем Дней в локации
@@ -395,6 +399,7 @@ def build_segments(df):
                 'Номер круга': circle_num,
                 'Продукт': product,
                 'Основной маршрут': main_route,
+                'Тип движения прибытия': move_type_arrival,
                 'Тип движения': move_type,
                 'Место события': place,
                 'Локация откуда': loc_from,
@@ -441,40 +446,61 @@ def build_segments(df):
 
 
 
-def build_circle_operations_summary(segments_df, segment_dict):
+def _classify_arrival_departure(text):
+    """Приводит текст 'Тип движения' к одной из двух категорий: 'Прибытие' или 'Выбытие'."""
+    if pd.isna(text):
+        return 'Выбытие'
+    text_low = str(text).strip().lower()
+    if 'прибыт' in text_low:
+        return 'Прибытие'
+    return 'Выбытие'
+
+
+def build_circle_operations_summary(segments_df, segment_dict, circle_date_range=None):
     """
     Строит свод по кругам: для каждого круга (Номер КТК + Номер круга) -
     последовательность операций (Отрезок схемы) в хронологическом порядке.
 
+    circle_date_range: DataFrame с индексом (Номер КТК, Номер круга) и колонками
+    'min'/'max' - минимальная и максимальная "Дата события" ИЗ ИСХОДНЫХ данных
+    (не из сегментов!) для этого круга. Нужен, потому что последняя точка круга
+    (например, финальное прибытие в Китай) никогда не становится отдельным
+    отрезком в segments_df - её дату можно получить только из исходных событий.
+
     Номер (№) присваивается по порядку ПЕРВОГО появления каждой уникальной
-    "Отрезок схемы" внутри круга. Все вхождения этой схемы в круге (не только
-    подряд идущие) суммируются в одну строку. Три метрики времени:
+    "Отрезок схемы" внутри круга. На каждую "Отрезок схемы" - ВСЕГДА ровно
+    2 строки: "Прибытие" и "Выбытие" (даже если по факту в круге встретился
+    только один из этих типов - вторая строка идёт с нулём). Три метрики времени:
       - "Время круга" - сколько дней КТК шёл по кругу целиком (от первого
-        прибытия до последнего выбытия в круге), одно значение на весь круг;
+        события до последнего события в круге), одно значение на весь круг;
       - "Время в отрезке" - время в пути между локациями (было "Дней между
         локациями"), сумма по каждой уникальной "Отрезок схемы";
       - "Время на операции" - время нахождения в локации, между прибытием
         и выбытием (было "Дней в локации"), сумма по каждой уникальной
-        "Отрезок схемы".
+        "Отрезок схемы" отдельно для "Прибытие" и для "Выбытие".
     """
     if segments_df.empty:
         return pd.DataFrame()
 
     df = segments_df.copy()
-    df['Отрезок схемы'] = df['Отрезок'].astype(str).str.strip().map(segment_dict)
+    df['Отрезок схемы'] = df.apply(
+        lambda r: get_segment_scheme(r['Отрезок'], r.get('Перегруз'), segment_dict),
+        axis=1
+    )
     df['Дней между локациями'] = pd.to_numeric(df['Дней между локациями'], errors='coerce').fillna(0)
     df['Дней в локации'] = pd.to_numeric(df['Дней в локации'], errors='coerce').fillna(0)
-    df['_Дата прибытия (dt)'] = pd.to_datetime(df['Дата прибытия'], format='%d.%m.%Y', errors='coerce')
-    df['_Дата выбытия (dt)'] = pd.to_datetime(df['Дата выбытия'], format='%d.%m.%Y', errors='coerce')
 
     rows = []
     for (ktk, circle_num), grp in df.groupby(['Номер КТК', 'Номер круга'], sort=False):
         main_route = grp['Основной маршрут'].iloc[0] if 'Основной маршрут' in grp.columns else None
 
-        # Время круга: от первого прибытия до последнего выбытия в этом круге
-        start_date = grp['_Дата прибытия (dt)'].min()
-        end_date = grp['_Дата выбытия (dt)'].max()
-        circle_time = (end_date - start_date).days if pd.notna(start_date) and pd.notna(end_date) else None
+        # Время круга: берём точный диапазон по исходным событиям, если он передан
+        circle_time = None
+        if circle_date_range is not None and (ktk, circle_num) in circle_date_range.index:
+            start_date = circle_date_range.loc[(ktk, circle_num), 'min']
+            end_date = circle_date_range.loc[(ktk, circle_num), 'max']
+            if pd.notna(start_date) and pd.notna(end_date):
+                circle_time = (end_date.normalize() - start_date.normalize()).days
 
         # № = порядок первого появления каждой уникальной "Отрезок схемы" в этом круге
         order_map = {}
@@ -488,15 +514,15 @@ def build_circle_operations_summary(segments_df, segment_dict):
 
         # Сумма "Дней между локациями" (время в отрезке) по каждой уникальной "Отрезок схемы" в круге
         agg_segment = grp.groupby('Отрезок схемы', sort=False, dropna=True)['Дней между локациями'].sum().reset_index()
-        agg_segment['№'] = agg_segment['Отрезок схемы'].map(order_map)
 
-        # "Время на операции" разбиваем ещё и по "Тип движения"
-        agg_op = grp.groupby(['Отрезок схемы', 'Тип движения'], sort=False, dropna=False)['Дней в локации'].sum().reset_index()
+        # "Время на операции" разбиваем по РЕАЛЬНЫМ (литеральным) значениям "Тип движения" -
+        # только те статусы, что фактически встретились в круге для этой "Отрезок схемы", без пустых строк
+        agg_op = grp.groupby(
+            ['Отрезок схемы', 'Тип движения'],
+            sort=False, dropna=False
+        )['Дней в локации'].sum().reset_index()
         agg_op['№'] = agg_op['Отрезок схемы'].map(order_map)
 
-        # Собираем строки: для каждой "Отрезок схемы" - одна строка на каждый её "Тип движения",
-        # "Время в отрезке" показываем только в первой строке схемы (чтобы не задваивать сумму),
-        # в остальных - пусто
         agg = agg_op.merge(
             agg_segment[['Отрезок схемы', 'Дней между локациями']],
             on='Отрезок схемы', how='left'
@@ -541,7 +567,241 @@ def build_circle_operations_summary(segments_df, segment_dict):
     return pd.DataFrame(rows)
 
 
-def save_processed_data(df, output_folder):
+
+def _normalize_schema_key(value):
+    """Нормализует строку схемы для сопоставления со справочником Схемы.xlsx."""
+    if pd.isna(value):
+        return None
+
+    value = str(value).strip()
+    # Убираем лишние пробелы вокруг стрелок и внутри текста.
+    parts = [part.strip() for part in value.split('→')]
+    parts = [' '.join(part.split()) for part in parts]
+    return ' → '.join(parts)
+
+
+def _normalize_overload(value):
+    """Нормализует признак перегруза для сопоставления со справочником.
+
+    В справочнике ожидаются значения 'Да' / 'Нет'. Пустое значение
+    означает, что для данного отрезка нет отдельного правила по перегрузу.
+    """
+    if pd.isna(value):
+        return None
+
+    value = str(value).strip().lower()
+    if value in {'да', 'yes', 'true', '1'}:
+        return 'Да'
+    if value in {'нет', 'no', 'false', '0'}:
+        return 'Нет'
+    return value.capitalize() if value else None
+
+
+def build_segment_dict(segment_df):
+    """Строит два справочника для Отрезок схемы.
+
+    1. Точное правило: (Отрезок, Перегруз) -> Отрезок схемы.
+    2. Общее правило: Отрезок -> Отрезок схемы для строк, где Перегруз не указан.
+
+    Важно: при наличии только правила с 'Да' или только с 'Нет' оно НЕ
+    применяется к противоположному значению перегруза. Это позволяет
+    постепенно заполнять справочник без неверных подстановок.
+    """
+    exact = {}
+    generic = {}
+
+    for _, row in segment_df.iterrows():
+        segment = row.get('Отрезок (сл. назначение)')
+        scheme = row.get('отрезок схемы')
+        if pd.isna(segment) or pd.isna(scheme):
+            continue
+
+        segment = str(segment).strip()
+        scheme = str(scheme).strip()
+        overload = _normalize_overload(row.get('Перегруз')) if 'Перегруз' in segment_df.columns else None
+
+        if overload is None:
+            # Общее правило применяется только когда в источнике перегруз не указан.
+            generic.setdefault(segment, scheme)
+        else:
+            exact[(segment, overload)] = scheme
+
+    return {'exact': exact, 'generic': generic}
+
+
+def get_segment_scheme(segment, overload, segment_dict):
+    """Возвращает Отрезок схемы с учетом признака Перегруз."""
+    if pd.isna(segment):
+        return None
+
+    segment = str(segment).strip()
+    overload = _normalize_overload(overload)
+
+    exact = segment_dict.get('exact', {})
+    generic = segment_dict.get('generic', {})
+
+    if overload is not None and (segment, overload) in exact:
+        return exact[(segment, overload)]
+
+    # Если есть обычная строка без значения Перегруз, она может быть
+    # использована для любого перегруза как нейтральное правило.
+    if segment in generic:
+        return generic[segment]
+
+    # Не подменяем 'Да' на 'Нет' и наоборот. При неполном справочнике
+    # правильнее оставить значение пустым до его заполнения.
+    return None
+
+
+def build_circle_event_schema(df, segment_dict, circle_date_range=None, product2_dict=None):
+    """
+    Построчная (по каждому СОБЫТИЮ, а не по визиту/отрезку) раскладка внутри круга:
+      - "Отрезок" = Локация текущей строки -> Локация следующей строки (та же логика,
+        что и "Следующий отрезок" на листе "Обработанные данные"), включая самопереходы
+        (X -> X) внутри одной локации;
+      - "Схема участка" = "отрезок схемы" из справочника с учетом "Перегруз";
+      - "№ отрезка" растёт на 1 при каждой смене пары (Схема участка, Отрезок)
+        относительно предыдущей строки круга - даже если такая же пара уже была раньше;
+      - "дата начала/окончания операции" и "Длительность операции" - дата этой строки
+        и дата следующей строки (в пределах того же КТК), разница в календарных днях;
+      - "Схема движения по отрезкам" - склеенная через " → " последовательность
+        уникальных подряд идущих "Схема участка" по всему кругу (одна и та же строка
+        на каждую строку этого круга).
+    """
+    if df.empty or 'Номер круга' not in df.columns:
+        return pd.DataFrame()
+
+    circle_df = df[df['Номер круга'].notna()].copy()
+    if circle_df.empty:
+        return pd.DataFrame()
+
+    circle_df = circle_df.sort_values(['Номер КТК', 'Дата события'], kind='mergesort').reset_index(drop=True)
+
+    # Следующую локацию и дату ищем только ВНУТРИ того же круга.
+    # Это важно: последняя строка круга не должна получать переход
+    # к первой строке следующего круга или оставаться без завершающего отрезка.
+    group_cols = ['Номер КТК', 'Номер круга']
+    next_location = circle_df.groupby(group_cols)['Локация'].shift(-1)
+    next_date = circle_df.groupby(group_cols)['Дата события'].shift(-1)
+
+    has_next_loc = next_location.notna()
+    has_cur_loc = circle_df['Локация'].notna()
+
+    # Последняя строка каждого круга определяется именно по границе группы,
+    # а не по отсутствию следующей строки во всём КТК.
+    is_last_in_circle = ~circle_df.duplicated(subset=group_cols, keep='last')
+
+    circle_df['Отрезок'] = None
+    normal_mask = (~is_last_in_circle) & has_next_loc & has_cur_loc
+    circle_df.loc[normal_mask, 'Отрезок'] = (
+        circle_df.loc[normal_mask, 'Локация'].astype(str)
+        + ' → '
+        + next_location.loc[normal_mask].astype(str)
+    )
+
+    # Для последней строки круга отрезок равен конечной локации.
+    # Например: ... → Китай, а последняя строка получает просто "Китай".
+    last_mask = is_last_in_circle & has_cur_loc
+    circle_df.loc[last_mask, 'Отрезок'] = circle_df.loc[last_mask, 'Локация'].astype(str)
+
+    circle_df['дата начала операции'] = circle_df['Дата события']
+    circle_df['дата окончания операции'] = next_date
+
+    # Для последней строки круга дата окончания равна дате начала этой же строки.
+    circle_df.loc[last_mask, 'дата окончания операции'] = circle_df.loc[last_mask, 'Дата события']
+    mask_dates = circle_df['дата начала операции'].notna() & circle_df['дата окончания операции'].notna()
+    circle_df['Длительность операции'] = None
+    circle_df.loc[mask_dates, 'Длительность операции'] = (
+        circle_df.loc[mask_dates, 'дата окончания операции'].dt.normalize()
+        - circle_df.loc[mask_dates, 'дата начала операции'].dt.normalize()
+    ).dt.days
+
+    # Схема участка определяется только по справочнику Отрезки.xlsx с учетом Перегруз.
+    # Автоматическое формирование названий "Межсервис <Локация>" отключено.
+    circle_df['Схема участка'] = circle_df.apply(
+        lambda r: get_segment_scheme(r['Отрезок'], r.get('Перегруз'), segment_dict),
+        axis=1
+    )
+
+    # № отрезка: растёт при смене пары (Схема участка, Отрезок) относительно предыдущей строки круга
+    nums = pd.Series(index=circle_df.index, dtype='float64')
+    for (ktk, circle_num), grp in circle_df.groupby(['Номер КТК', 'Номер круга'], sort=False):
+        prev_pair = None
+        n = 0
+        for idx, row in grp.iterrows():
+            pair = (row['Схема участка'], row['Отрезок'])
+            if pair != prev_pair:
+                n += 1
+                prev_pair = pair
+            nums.loc[idx] = n
+    circle_df['№ отрезка'] = nums
+
+    # Основной маршрут (берём как есть из исходных данных, если колонка есть)
+    if 'Основной маршрут' in circle_df.columns:
+        pass  # уже есть в circle_df как колонка исходных данных
+    else:
+        circle_df['Основной маршрут'] = None
+
+    # Время круга, Первая точка круга, Последняя точка круга - из точного диапазона дат
+    # по исходным событиям (circle_date_range), если он передан
+    circle_df['Первая точка круга'] = None
+    circle_df['Последняя точка круга'] = None
+    circle_df['Время круга'] = None
+    if circle_date_range is not None:
+        for (ktk, circle_num), grp_idx in circle_df.groupby(['Номер КТК', 'Номер круга'], sort=False).groups.items():
+            if (ktk, circle_num) in circle_date_range.index:
+                start_date = circle_date_range.loc[(ktk, circle_num), 'min']
+                end_date = circle_date_range.loc[(ktk, circle_num), 'max']
+                if pd.notna(start_date):
+                    circle_df.loc[grp_idx, 'Первая точка круга'] = start_date.strftime('%d.%m.%Y')
+                if pd.notna(end_date):
+                    circle_df.loc[grp_idx, 'Последняя точка круга'] = end_date.strftime('%d.%m.%Y')
+                if pd.notna(start_date) and pd.notna(end_date):
+                    circle_df.loc[grp_idx, 'Время круга'] = (end_date.normalize() - start_date.normalize()).days
+
+    # Схема движения по отрезкам: последовательность "Схема участка" по кругу.
+    # Подряд идущие одинаковые операции схлопываются в одну,
+    # причем сравнение выполняется по нормализованному названию (без влияния
+    # лишних пробелов в начале/конце и вокруг стрелок).
+    scheme_seq_map = {}
+    for (ktk, circle_num), grp in circle_df.groupby(['Номер КТК', 'Номер круга'], sort=False):
+        seq = []
+        prev_val = None
+        for val in grp['Схема участка']:
+            if pd.isna(val):
+                continue
+            normalized_val = _normalize_schema_key(val)
+            if normalized_val is None:
+                continue
+            if normalized_val != prev_val:
+                seq.append(normalized_val)
+                prev_val = normalized_val
+        scheme_seq_map[(ktk, circle_num)] = ' → '.join(seq)
+    circle_df['Схема движения по отрезкам'] = circle_df.apply(
+        lambda r: scheme_seq_map.get((r['Номер КТК'], r['Номер круга'])), axis=1
+    )
+
+    # Продукт 2 определяется по полной схеме движения по отрезкам.
+    # Сопоставление делаем по нормализованному тексту, чтобы не зависеть
+    # от лишних пробелов в начале/конце строки и вокруг стрелок.
+    if product2_dict is not None:
+        circle_df['Продукт 2'] = circle_df['Схема движения по отрезкам'].map(
+            lambda x: product2_dict.get(_normalize_schema_key(x)) if pd.notna(x) else None
+        )
+    else:
+        circle_df['Продукт 2'] = None
+
+    result_cols = [
+        'Номер КТК', 'Номер круга', 'Основной маршрут',
+        'Первая точка круга', 'Последняя точка круга', 'Время круга',
+        'Схема участка', '№ отрезка', 'Отрезок', 'Тип движения',
+        'дата начала операции', 'дата окончания операции', 'Длительность операции',
+        'Схема движения по отрезкам', 'Продукт 2'
+    ]
+    return circle_df[result_cols].copy()
+
+
+def save_processed_data(df, output_folder, product2_dict=None):
     """
     Файл 2: Обработанные данные
     Лист 1: Обработанные данные
@@ -601,25 +861,40 @@ def save_processed_data(df, output_folder):
         os.path.join(current_dir, "Справочники", "Отрезки.xlsx")
     )
 
+    required_segment_cols = {'Отрезок (сл. назначение)', 'отрезок схемы'}
+    if not required_segment_cols.issubset(отрезки.columns):
+        print("    КРИТИЧЕСКАЯ ОШИБКА: В Отрезки.xlsx отсутствуют колонки 'Отрезок (сл. назначение)' и/или 'отрезок схемы'")
+        return None, None, {}
+
     отрезки = clean_string_columns(
         отрезки,
-        ['Отрезок (сл. назначение)', 'отрезок схемы']
+        ['Отрезок (сл. назначение)', 'Перегруз', 'отрезок схемы']
     )
 
-    segment_dict = dict(zip(
-        отрезки['Отрезок (сл. назначение)'],
-        отрезки['отрезок схемы']
-    ))
+    if 'Перегруз' not in отрезки.columns:
+        print("    ВНИМАНИЕ: В справочнике Отрезки.xlsx нет колонки 'Перегруз'. Используются только общие правила без учета перегруза.")
+    else:
+        print("    Справочник Отрезки: найден учет 'Перегруз'")
 
-    df['Отрезок схемы'] = (
-        df['Отрезок']
-        .astype(str)
-        .str.strip()
-        .map(segment_dict)
+    segment_dict = build_segment_dict(отрезки)
+
+    df['Отрезок схемы'] = df.apply(
+        lambda r: get_segment_scheme(r['Отрезок'], r.get('Перегруз'), segment_dict),
+        axis=1
     )
 
-    # Свод по кругам: номер этапа + суммарное время по каждой уникальной "Отрезок схемы"
-    circle_summary_df = build_circle_operations_summary(segments_df, segment_dict)
+    # Точный диапазон дат круга считаем по ИСХОДНЫМ событиям (df), а не по сегментам:
+    # последняя точка круга (например, финальное прибытие в Китай) никогда не становится
+    # отдельным отрезком в segments_df, но как событие в df она есть всегда.
+    circle_mask_for_range = df['Номер круга'].notna()
+    circle_date_range = (
+        df[circle_mask_for_range]
+        .groupby(['Номер КТК', 'Номер круга'])['Дата события']
+        .agg(['min', 'max'])
+    )
+
+    # Свод по кругам: построчная (по событиям) раскладка со схемой участка, № отрезка и Межсервис
+    circle_event_schema_df = build_circle_event_schema(df, segment_dict, circle_date_range, product2_dict)
 
     # Переименовываем колонки для итогового вывода
     df = df.rename(columns={
@@ -661,9 +936,9 @@ def save_processed_data(df, output_folder):
             print(f"    ! Лист 'Отрезки маршрута' — нет данных")
 
         # Лист 3: Свод по кругам
-        if not circle_summary_df.empty:
-            circle_summary_df.to_excel(writer, sheet_name='Свод по кругам', index=False)
-            print(f"    ✓ Лист 'Свод по кругам' ({len(circle_summary_df):,} строк)")
+        if not circle_event_schema_df.empty:
+            circle_event_schema_df.to_excel(writer, sheet_name='Свод по кругам', index=False)
+            print(f"    ✓ Лист 'Свод по кругам' ({len(circle_event_schema_df):,} строк)")
         else:
             print(f"    ! Лист 'Свод по кругам' — нет данных")
 
@@ -679,6 +954,7 @@ def process_ktk_data():
     продукты_path = os.path.join(current_dir, "Справочники", "Продукты.xlsx")
     операции_path = os.path.join(current_dir, "Справочники", "Операции.xlsx")
     отрезки_path = os.path.join(current_dir, "Справочники", "Отрезки.xlsx")
+    схемы_path = os.path.join(current_dir, "Справочники", "Схемы.xlsx")
 
     print("=" * 60)
     print("НАЧАЛО ОБРАБОТКИ ДАННЫХ КТК")
@@ -694,10 +970,32 @@ def process_ktk_data():
         продукты is None or
         операции is None or
         отрезки is None):
-        return None, None
+        return None, None, {}
 
     print(f"    Справочник мест: {len(справочник_место)} записей")
     print(f"    Справочник продуктов: {len(продукты)} записей")
+
+    # Справочник схем для "Продукт 2".
+    # Файл не является обязательным для основной обработки: если его нет,
+    # "Продукт 2" останется пустым.
+    схемы = load_excel_safe(схемы_path)
+    product2_dict = {}
+    if схемы is not None:
+        required_schema_cols = {'Схема движения по отрезкам', 'Продукт 2'}
+        if required_schema_cols.issubset(схемы.columns):
+            схемы = clean_string_columns(
+                схемы,
+                ['Схема движения по отрезкам', 'Продукт 2']
+            )
+            схемы['_schema_key'] = схемы['Схема движения по отрезкам'].map(_normalize_schema_key)
+            схемы = схемы[
+                схемы['_schema_key'].notna() &
+                схемы['Продукт 2'].notna()
+            ].drop_duplicates(subset=['_schema_key'], keep='first')
+            product2_dict = dict(zip(схемы['_schema_key'], схемы['Продукт 2']))
+            print(f"    Справочник схем: {len(product2_dict)} записей")
+        else:
+            print("    ВНИМАНИЕ: В Схемы.xlsx должны быть колонки 'Схема движения по отрезкам' и 'Продукт 2'")
 
     справочник_место = clean_string_columns(справочник_место, ['Место события'])
     справочник_место = справочник_место.drop_duplicates(subset=['Место события'], keep='first')
@@ -705,7 +1003,7 @@ def process_ktk_data():
     print("\n2. Загрузка исходных данных...")
     df = load_excel_safe(source_path)
     if df is None:
-        return None, None
+        return None, None, {}
     print(f"    Загружено {len(df):,} строк")
 
     df.columns = df.columns.str.strip()
@@ -889,20 +1187,20 @@ def process_ktk_data():
     print(f"Обработано контейнеров: {df['Номер КТК'].nunique() if 'Номер КТК' in df.columns else 'Успешно'}")
     print(f"Найдено кругов всего: {len(circles_df):,}")
 
-    return df, circles_df
+    return df, circles_df, product2_dict
 
 
 if __name__ == "__main__":
     try:
         output_folder = os.path.dirname(os.path.abspath(__file__))
 
-        result_df, circles_df = process_ktk_data()
+        result_df, circles_df, product2_dict = process_ktk_data()
         if result_df is not None and len(result_df) > 0:
             # Файл 1: Отчёт (группировка + СВОД + детализация)
             save_report(result_df, circles_df, output_folder)
 
             # Файл 2: Обработанные данные (один лист со всеми колонками)
-            save_processed_data(result_df, output_folder)
+            save_processed_data(result_df, output_folder, product2_dict)
 
             print("\n✅ Оба файла успешно сформированы!")
         else:
