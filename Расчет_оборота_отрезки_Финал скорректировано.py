@@ -33,6 +33,180 @@ def clean_string_columns(df, col_names):
     return df
 
 
+def _parse_circle_date(value):
+    """Разбирает дату границы круга, которая может быть строкой или Timestamp."""
+    if pd.isna(value):
+        return pd.NaT
+    return pd.to_datetime(value, dayfirst=True, errors='coerce')
+
+
+def _normalize_circle_key(ktk, circle_num):
+    """Единый ключ круга независимо от int/float в столбце номера круга."""
+    if pd.isna(ktk) or pd.isna(circle_num):
+        return None
+    try:
+        circle_num = int(float(circle_num))
+    except (TypeError, ValueError):
+        return None
+    return str(ktk).strip(), circle_num
+
+
+def _circle_boundary_lookup(circles_df):
+    """Возвращает точные начальную и конечную даты из списка найденных кругов."""
+    lookup = {}
+    if circles_df is None or circles_df.empty:
+        return lookup
+    required = {'Номер КТК', 'Номер круга', 'Начало', 'Окончание'}
+    if not required.issubset(circles_df.columns):
+        return lookup
+
+    for _, row in circles_df.iterrows():
+        key = _normalize_circle_key(row['Номер КТК'], row['Номер круга'])
+        if key is None:
+            continue
+        lookup[key] = (
+            _parse_circle_date(row['Начало']),
+            _parse_circle_date(row['Окончание'])
+        )
+    return lookup
+
+
+def _build_circle_date_range(circles_df):
+    """Строит диапазоны дат из результатов поиска кругов, а не из уже размеченных строк."""
+    lookup = _circle_boundary_lookup(circles_df)
+    if not lookup:
+        return None
+    records = [
+        {'Номер КТК': key[0], 'Номер круга': key[1], 'min': dates[0], 'max': dates[1]}
+        for key, dates in lookup.items()
+    ]
+    boundary_df = pd.DataFrame(records)
+    return boundary_df.set_index(['Номер КТК', 'Номер круга'])[['min', 'max']]
+
+
+def _find_missing_circle_endpoint_rows(all_events, circle_events, circles_df):
+    """Находит конечное прибытие в Китай, если оно стало началом следующего круга.
+
+    Важно для скорости: раньше для каждого круга заново фильтровалась вся
+    таблица событий. При десятках тысяч кругов это приводило к сотням миллионов
+    и миллиардам проверок. Теперь события в Китае индексируются один раз по
+    ключу (Номер КТК, календарная дата), после чего кандидат выбирается напрямую.
+    """
+    empty = pd.DataFrame(columns=all_events.columns)
+    if (circles_df is None or circles_df.empty or all_events.empty or circle_events.empty
+            or 'Дата события' not in all_events.columns or 'Локация' not in all_events.columns
+            or 'Номер КТК' not in all_events.columns):
+        return empty
+
+    boundary_lookup = _circle_boundary_lookup(circles_df)
+    if not boundary_lookup:
+        return empty
+
+    metadata_lookup = {}
+    for _, meta in circles_df.iterrows():
+        key = _normalize_circle_key(meta.get('Номер КТК'), meta.get('Номер круга'))
+        if key is not None:
+            metadata_lookup[key] = meta
+
+    all_dates = pd.to_datetime(all_events['Дата события'], errors='coerce')
+    all_ktk = all_events['Номер КТК'].astype(str).str.strip()
+    all_locations = all_events['Локация'].astype(str).str.strip()
+
+    # Однократно строим индекс всех событий прибытия/нахождения в Китае.
+    china_mask = all_locations.eq('Китай') & all_dates.notna()
+    china_events = all_events.loc[china_mask].copy()
+    if china_events.empty:
+        return empty
+    china_events['_endpoint_ktk_key'] = all_ktk.loc[china_mask].to_numpy()
+    china_events['_endpoint_date_key'] = all_dates.loc[china_mask].dt.normalize().to_numpy()
+    endpoint_lookup = {}
+    for (ktk_key, date_key), candidates in china_events.groupby(
+        ['_endpoint_ktk_key', '_endpoint_date_key'], sort=False
+    ):
+        endpoint_lookup[(str(ktk_key).strip(), pd.Timestamp(date_key))] = candidates.drop(
+            columns=['_endpoint_ktk_key', '_endpoint_date_key']
+        )
+
+    synthetic_rows = []
+    for (ktk, circle_num), grp in circle_events.groupby(['Номер КТК', 'Номер круга'], sort=False):
+        key = _normalize_circle_key(ktk, circle_num)
+        if key is None or key not in boundary_lookup:
+            continue
+
+        start_date, end_date = boundary_lookup[key]
+        if pd.isna(end_date):
+            continue
+        end_date_key = pd.Timestamp(end_date).normalize()
+
+        grp_dates = pd.to_datetime(grp['Дата события'], errors='coerce')
+        grp_sorted = grp.assign(_circle_date_tmp=grp_dates).sort_values(
+            '_circle_date_tmp', kind='mergesort'
+        )
+        if not grp_sorted.empty:
+            last_row = grp_sorted.iloc[-1]
+            last_date = pd.to_datetime(last_row['Дата события'], errors='coerce')
+            last_loc = str(last_row.get('Локация', '')).strip()
+            # Если последняя строка круга уже является прибытием в Китай на конечную дату,
+            # копия не нужна.
+            if (pd.notna(last_date) and last_date.normalize() == end_date_key
+                    and last_loc == 'Китай'):
+                continue
+            # Не добавляем искусственную границу раньше событий, уже попавших в этот круг.
+            valid_group_dates = grp_dates.dropna()
+            if not valid_group_dates.empty and valid_group_dates.max().normalize() > end_date_key:
+                continue
+
+        candidates = endpoint_lookup.get((key[0], end_date_key))
+        if candidates is None or candidates.empty:
+            # Поиск круга всегда заканчивается на китайском событии. Если его нельзя
+            # найти по данным, не выдумываем событие и дату.
+            continue
+        candidates = candidates.copy()
+
+        meta = metadata_lookup.get(key)
+        target_move = meta.get('Тип прибытия') if meta is not None else None
+        if pd.notna(target_move) and 'Тип движения' in candidates.columns:
+            typed = candidates[candidates['Тип движения'].astype(str).str.strip().eq(str(target_move).strip())]
+            if not typed.empty:
+                candidates = typed
+
+        endpoint = candidates.iloc[-1].copy()
+        endpoint['Номер круга'] = key[1]
+        if 'Основной маршрут' in grp.columns:
+            route_values = grp['Основной маршрут'].dropna()
+            if not route_values.empty:
+                endpoint['Основной маршрут'] = route_values.iloc[0]
+        if 'Flag_point' in endpoint.index:
+            endpoint['Flag_point'] = 2
+        if 'Отрезок_между_флагами' in endpoint.index:
+            endpoint['Отрезок_между_флагами'] = 'Да'
+        if meta is not None and 'Вид расчета' in endpoint.index and pd.notna(meta.get('Вид расчета')):
+            endpoint['Вид расчета'] = meta.get('Вид расчета')
+        if 'Первая точка' in endpoint.index and pd.notna(start_date):
+            endpoint['Первая точка'] = start_date.strftime('%d.%m.%Y')
+        if 'Последняя точка' in endpoint.index:
+            endpoint['Последняя точка'] = end_date.strftime('%d.%m.%Y')
+        synthetic_rows.append(endpoint)
+
+    if not synthetic_rows:
+        return empty
+    return pd.DataFrame(synthetic_rows, columns=all_events.columns)
+
+def _append_synthetic_rows(base_df, synthetic_df, index_source_df=None):
+    """Добавляет синтетические граничные строки с новыми индексами."""
+    if synthetic_df is None or synthetic_df.empty:
+        return base_df
+    result = base_df.copy()
+    synthetic_df = synthetic_df.copy()
+    source = index_source_df if index_source_df is not None else base_df
+    try:
+        next_idx = int(max(source.index)) + 1 if len(source.index) else 0
+    except (TypeError, ValueError):
+        next_idx = len(result)
+    synthetic_df.index = range(next_idx, next_idx + len(synthetic_df))
+    return pd.concat([result, synthetic_df], axis=0, sort=False)
+
+
 def find_all_circles_with_flags(group):
     group = group.sort_values('Дата события', kind='mergesort').reset_index(drop=True)
 
@@ -59,7 +233,7 @@ def find_all_circles_with_flags(group):
 
     china_records = china_events.sort_values('Дата события', kind='mergesort').to_dict('records')
 
-    if len(china_records) < 2:
+    if not china_records:
         return group, []
 
     def is_first_point(row):
@@ -75,6 +249,7 @@ def find_all_circles_with_flags(group):
     circle_num = 1
     i = 0
     total_china = len(china_records)
+    last_completed_end_idx = -1
 
     while i < total_china:
         if not is_first_point(china_records[i]):
@@ -151,10 +326,47 @@ def find_all_circles_with_flags(group):
                 'Является кругом': True
             })
 
+            last_completed_end_idx = second_idx
             circle_num += 1
             i = next(idx for idx, rec in enumerate(china_records) if rec['idx_in_group'] == second_idx)
         else:
             i = j
+
+    # Нумеруем также текущий незавершённый круг. Полный круг требует возвращения
+    # в Китай, но после отправления из Китая события должны уже получать следующий
+    # номер, даже если на дату выгрузки возврата ещё не было.
+    open_start = None
+    for rec in china_records:
+        rec_idx = rec['idx_in_group']
+        # Конечное прибытие в Китай может одновременно быть стартовой границей
+        # следующего круга (как 15.08.2025 для круга 2). Поэтому последнюю точку
+        # завершённого круга тоже рассматриваем как возможное начало текущего круга.
+        if rec_idx < last_completed_end_idx or not is_first_point(rec):
+            continue
+
+        # Считаем круг начавшимся, только если после точки старта есть событие
+        # за пределами Китая. Это не позволяет превратить одиночную запись в Китае
+        # в новый круг без фактического продолжения маршрута.
+        later_locations = group.loc[rec_idx + 1:, 'Локация']
+        has_departed_china = later_locations.notna().any() and later_locations.astype(str).str.strip().ne('Китай').any()
+        if has_departed_china:
+            open_start = rec
+            break
+
+    if open_start is not None:
+        first_idx = open_start['idx_in_group']
+        first_date = open_start['Дата события']
+        first_type = open_start['Тип движения']
+        ongoing_rows = group.index >= first_idx
+        route_parts = group.loc[ongoing_rows, 'Локация'].dropna().tolist()
+        unique_route_parts = [loc for idx, loc in enumerate(route_parts) if idx == 0 or loc != route_parts[idx - 1]]
+        ongoing_route = ' → '.join(unique_route_parts)
+
+        group.loc[ongoing_rows, 'Номер круга'] = circle_num
+        group.loc[ongoing_rows, 'Отрезок_между_флагами'] = 'Да'
+        group.loc[ongoing_rows, 'Основной маршрут'] = ongoing_route
+        group.loc[ongoing_rows, 'Вид расчета'] = f"{first_type} - незавершённый круг"
+        group.at[first_idx, 'Flag_point'] = 1
 
     return group, circles
 
@@ -265,7 +477,7 @@ def save_report(df, circles_df, output_folder):
     return report_file
 
 
-def build_segments(df):
+def build_segments(df, circles_df=None):
     """
     Строит таблицу отрезков маршрута по локациям для каждого КТК в рамках круга.
 
@@ -290,6 +502,10 @@ def build_segments(df):
 
     # Работаем только по строкам внутри кругов
     df_circles = df[df['Номер круга'].notna()].copy()
+    synthetic_endpoints = _find_missing_circle_endpoint_rows(df, df_circles, circles_df)
+    if not synthetic_endpoints.empty:
+        df_circles = _append_synthetic_rows(df_circles, synthetic_endpoints, df)
+        print(f"    Добавлено конечных точек кругов в Китай: {len(synthetic_endpoints):,}")
     print(f"    Строк внутри кругов: {len(df_circles):,}")
 
     if df_circles.empty:
@@ -417,11 +633,35 @@ def build_segments(df):
             for row_idx in visits_row_indices[i]:
                 row_to_segment[row_idx] = segment_label
 
-            # Последний визит в круге ("КУДА" последнего отрезка) сам никогда не бывает "ОТКУДА",
-            # поэтому его строки относим к последнему отрезку (иначе они останутся без значения)
-            if i == len(visits) - 2:
-                for row_idx in visits_row_indices[i + 1]:
-                    row_to_segment[row_idx] = segment_label
+
+        # Добавляем отдельную конечную строку круга: "Китай" с одинаковыми
+        # датами прибытия/выбытия (для последней точки следующего круга не берём).
+        if visits:
+            final_visit = visits[-1]
+            final_loc = final_visit['локация']
+            final_date = final_visit['дата_выбытия']
+            final_label = str(final_loc).strip()
+            rows.append({
+                'Номер КТК': ktk,
+                'Номер круга': circle_num,
+                'Продукт': product,
+                'Основной маршрут': main_route,
+                'Тип движения прибытия': final_visit['тип_движения_прибытия'],
+                'Тип движения': final_visit['тип_движения'],
+                'Место события': final_visit['место_события'],
+                'Локация откуда': final_loc,
+                'Локация куда': None,
+                'Отрезок': final_label,
+                'Дата прибытия': final_date.strftime('%d.%m.%Y') if pd.notna(final_date) else None,
+                'Дата выбытия': final_date.strftime('%d.%m.%Y') if pd.notna(final_date) else None,
+                'Дней в локации': 0,
+                '_Дата прибытия (raw)': final_date,
+                '_Дата выбытия (raw)': final_date,
+            })
+            # Строки последнего события относятся к конечной локации ("Китай"),
+            # а не к предыдущему переходу ("ДВ → Китай").
+            for row_idx in visits_row_indices[-1]:
+                row_to_segment[row_idx] = final_label
 
     print(f"    Отрезков построено: {len(rows):,}")
 
@@ -433,10 +673,17 @@ def build_segments(df):
     # минус дата выбытия ТЕКУЩЕЙ строки, для одного и того же КТК (сквозняком, без привязки к кругу —
     # т.к. переход из последнего отрезка одного круга в первый отрезок следующего круга тоже занимает время)
     segments_df['_next_arrival_raw'] = segments_df.groupby('Номер КТК')['_Дата прибытия (raw)'].shift(-1)
-    mask = segments_df['_next_arrival_raw'].notna() & segments_df['_Дата выбытия (raw)'].notna()
+    # Интервал считаем только для строки реального перехода. Конечная точка
+    # круга (например, "Китай") не должна забирать на себя время до следующего круга.
+    has_destination = segments_df['Локация куда'].notna()
+    mask = (
+        segments_df['_next_arrival_raw'].notna()
+        & segments_df['_Дата выбытия (raw)'].notna()
+        & has_destination
+    )
     segments_df['Дней между локациями'] = None
-    # Считаем только по календарным датам, без времени (иначе часы/минуты в "Дата события"
-    # могут "съедать" целый день при округлении вниз)
+    segments_df.loc[~has_destination, 'Дней между локациями'] = 0
+    # Считаем только по календарным датам, без времени.
     next_arrival_date_only = segments_df.loc[mask, '_next_arrival_raw'].dt.normalize()
     departure_date_only = segments_df.loc[mask, '_Дата выбытия (raw)'].dt.normalize()
     segments_df.loc[mask, 'Дней между локациями'] = (next_arrival_date_only - departure_date_only).dt.days
@@ -483,10 +730,10 @@ def build_circle_operations_summary(segments_df, segment_dict, circle_date_range
         return pd.DataFrame()
 
     df = segments_df.copy()
-    df['Отрезок схемы'] = df.apply(
-        lambda r: get_segment_scheme(r['Отрезок'], r.get('Перегруз'), segment_dict),
-        axis=1
-    )
+    print("    Сопоставляю 'Отрезок схемы' по справочнику...", flush=True)
+    overload_series = df['Перегруз'] if 'Перегруз' in df.columns else pd.Series(None, index=df.index)
+    df['Отрезок схемы'] = map_segment_schemes(df['Отрезок'], overload_series, segment_dict)
+    print("    Сопоставление отрезков завершено.", flush=True)
     df['Дней между локациями'] = pd.to_numeric(df['Дней между локациями'], errors='coerce').fillna(0)
     df['Дней в локации'] = pd.to_numeric(df['Дней в локации'], errors='coerce').fillna(0)
 
@@ -653,7 +900,27 @@ def get_segment_scheme(segment, overload, segment_dict):
     return None
 
 
-def build_circle_event_schema(df, segment_dict, circle_date_range=None, product2_dict=None):
+def map_segment_schemes(segment_series, overload_series, segment_dict):
+    """Быстро сопоставляет схемы отрезков по справочнику без DataFrame.apply(axis=1)."""
+    exact = segment_dict.get('exact', {})
+    generic = segment_dict.get('generic', {})
+    segments = segment_series.map(lambda value: str(value).strip() if pd.notna(value) else None)
+    overloads = overload_series.map(_normalize_overload)
+
+    # Короткий проход по парам ключей значительно дешевле создания Series на каждую строку.
+    mapped = pd.Series(
+        (exact.get((seg, ov)) if seg is not None and ov is not None else None
+         for seg, ov in zip(segments.tolist(), overloads.tolist())),
+        index=segment_series.index,
+        dtype='object'
+    )
+    fallback_mask = mapped.isna() & segments.notna()
+    if fallback_mask.any():
+        mapped.loc[fallback_mask] = segments.loc[fallback_mask].map(generic)
+    return mapped
+
+
+def build_circle_event_schema(df, segment_dict, circle_date_range=None, product2_dict=None, circles_df=None):
     """
     Построчная (по каждому СОБЫТИЮ, а не по визиту/отрезку) раскладка внутри круга:
       - "Отрезок" = Локация текущей строки -> Локация следующей строки (та же логика,
@@ -674,6 +941,11 @@ def build_circle_event_schema(df, segment_dict, circle_date_range=None, product2
     circle_df = df[df['Номер круга'].notna()].copy()
     if circle_df.empty:
         return pd.DataFrame()
+
+    synthetic_endpoints = _find_missing_circle_endpoint_rows(df, circle_df, circles_df)
+    if not synthetic_endpoints.empty:
+        circle_df = _append_synthetic_rows(circle_df, synthetic_endpoints, df)
+        print(f"    Для 'Свод по кругам' добавлено конечных точек в Китай: {len(synthetic_endpoints):,}")
 
     circle_df = circle_df.sort_values(['Номер КТК', 'Дата события'], kind='mergesort').reset_index(drop=True)
 
@@ -718,10 +990,10 @@ def build_circle_event_schema(df, segment_dict, circle_date_range=None, product2
 
     # Схема участка определяется только по справочнику Отрезки.xlsx с учетом Перегруз.
     # Автоматическое формирование названий "Межсервис <Локация>" отключено.
-    circle_df['Схема участка'] = circle_df.apply(
-        lambda r: get_segment_scheme(r['Отрезок'], r.get('Перегруз'), segment_dict),
-        axis=1
-    )
+    print("    Сопоставляю 'Схема участка' для строк кругов...", flush=True)
+    overload_series = circle_df['Перегруз'] if 'Перегруз' in circle_df.columns else pd.Series(None, index=circle_df.index)
+    circle_df['Схема участка'] = map_segment_schemes(circle_df['Отрезок'], overload_series, segment_dict)
+    print("    'Схема участка' рассчитана.", flush=True)
 
     # № отрезка: растёт при смене пары (Схема участка, Отрезок) относительно предыдущей строки круга
     nums = pd.Series(index=circle_df.index, dtype='float64')
@@ -747,17 +1019,23 @@ def build_circle_event_schema(df, segment_dict, circle_date_range=None, product2
     circle_df['Первая точка круга'] = None
     circle_df['Последняя точка круга'] = None
     circle_df['Время круга'] = None
-    if circle_date_range is not None:
-        for (ktk, circle_num), grp_idx in circle_df.groupby(['Номер КТК', 'Номер круга'], sort=False).groups.items():
-            if (ktk, circle_num) in circle_date_range.index:
-                start_date = circle_date_range.loc[(ktk, circle_num), 'min']
-                end_date = circle_date_range.loc[(ktk, circle_num), 'max']
-                if pd.notna(start_date):
-                    circle_df.loc[grp_idx, 'Первая точка круга'] = start_date.strftime('%d.%m.%Y')
-                if pd.notna(end_date):
-                    circle_df.loc[grp_idx, 'Последняя точка круга'] = end_date.strftime('%d.%m.%Y')
-                if pd.notna(start_date) and pd.notna(end_date):
-                    circle_df.loc[grp_idx, 'Время круга'] = (end_date.normalize() - start_date.normalize()).days
+    for (ktk, circle_num), grp_idx in circle_df.groupby(['Номер КТК', 'Номер круга'], sort=False).groups.items():
+        date_key = _normalize_circle_key(ktk, circle_num)
+        if circle_date_range is not None and date_key in circle_date_range.index:
+            start_date = circle_date_range.loc[date_key, 'min']
+            end_date = circle_date_range.loc[date_key, 'max']
+            if pd.notna(start_date):
+                circle_df.loc[grp_idx, 'Первая точка круга'] = start_date.strftime('%d.%m.%Y')
+            if pd.notna(end_date):
+                circle_df.loc[grp_idx, 'Последняя точка круга'] = end_date.strftime('%d.%m.%Y')
+            if pd.notna(start_date) and pd.notna(end_date):
+                circle_df.loc[grp_idx, 'Время круга'] = (end_date.normalize() - start_date.normalize()).days
+        else:
+            # Для незавершённого круга указываем старт, но не придумываем
+            # конечную дату и длительность по дате последнего наблюдаемого события.
+            group_dates = pd.to_datetime(circle_df.loc[grp_idx, 'Дата события'], errors='coerce').dropna()
+            if not group_dates.empty:
+                circle_df.loc[grp_idx, 'Первая точка круга'] = group_dates.min().strftime('%d.%m.%Y')
 
     # Схема движения по отрезкам: последовательность "Схема участка" по кругу.
     # Подряд идущие одинаковые операции схлопываются в одну,
@@ -801,7 +1079,7 @@ def build_circle_event_schema(df, segment_dict, circle_date_range=None, product2
     return circle_df[result_cols].copy()
 
 
-def save_processed_data(df, output_folder, product2_dict=None):
+def save_processed_data(df, output_folder, product2_dict=None, circles_df=None):
     """
     Файл 2: Обработанные данные
     Лист 1: Обработанные данные
@@ -819,7 +1097,7 @@ def save_processed_data(df, output_folder, product2_dict=None):
     # и для колонки "Отрезок" на листе "Обработанные данные"
     print(f"    Строю отрезки маршрута...")
     print(f"    Уникальных кругов в df: {df['Номер круга'].notna().sum():,} строк с кругом")
-    segments_df, row_to_segment = build_segments(df)
+    segments_df, row_to_segment = build_segments(df, circles_df)
 
     # Добавляем колонку "Следующий отрезок" в df: переход "Локация текущей строки -> Локация следующей строки",
     # по ВСЕМ строкам одного КТК подряд (не только внутри круга), с повторами, если локация не поменялась.
@@ -883,18 +1161,20 @@ def save_processed_data(df, output_folder, product2_dict=None):
         axis=1
     )
 
-    # Точный диапазон дат круга считаем по ИСХОДНЫМ событиям (df), а не по сегментам:
-    # последняя точка круга (например, финальное прибытие в Китай) никогда не становится
-    # отдельным отрезком в segments_df, но как событие в df она есть всегда.
-    circle_mask_for_range = df['Номер круга'].notna()
-    circle_date_range = (
-        df[circle_mask_for_range]
-        .groupby(['Номер КТК', 'Номер круга'])['Дата события']
-        .agg(['min', 'max'])
-    )
+    # Точные даты границ берём из результатов поиска кругов. Нельзя рассчитывать
+    # максимум только по строкам с одним Номером круга: конечное прибытие в Китай
+    # одновременно является началом следующего круга и при разметке может получить
+    # номер уже следующего круга.
+    circle_date_range = _build_circle_date_range(circles_df)
+    # Если круг не завершён и его нет в circles_df, не выводим max даты событий
+    # в качестве даты возврата в Китай: в таком случае конечная точка остаётся пустой.
 
-    # Свод по кругам: построчная (по событиям) раскладка со схемой участка, № отрезка и Межсервис
-    circle_event_schema_df = build_circle_event_schema(df, segment_dict, circle_date_range, product2_dict)
+    # Свод по кругам: построчная раскладка с восстановленной конечной точкой в Китае.
+    print("    Формирую лист 'Свод по кругам'...", flush=True)
+    circle_event_schema_df = build_circle_event_schema(
+        df, segment_dict, circle_date_range, product2_dict, circles_df
+    )
+    print(f"    'Свод по кругам' подготовлен: {len(circle_event_schema_df):,} строк.", flush=True)
 
     # Переименовываем колонки для итогового вывода
     df = df.rename(columns={
@@ -923,13 +1203,28 @@ def save_processed_data(df, output_folder, product2_dict=None):
 
     df_out = df[final_cols].copy()
 
-    with pd.ExcelWriter(processed_file, engine='openpyxl') as writer:
+    print("    Подготовка завершена; начинаю запись Excel. На листе 'Обработанные данные' сотни тысяч строк, запись может занять несколько минут.", flush=True)
+    # Для большого файла используем XlsxWriter: запись сотен тысяч строк
+    # обычно заметно быстрее, чем openpyxl. Не включаем constant_memory,
+    # поскольку этот режим несовместим с порядком записи ячеек pandas.to_excel.
+    with pd.ExcelWriter(
+        processed_file,
+        engine='xlsxwriter',
+        engine_kwargs={
+            'options': {
+                'strings_to_formulas': False,
+                'strings_to_urls': False,
+            }
+        },
+    ) as writer:
         # Лист 1: Обработанные данные
+        print(f"    Записываю лист 'Обработанные данные' ({len(df_out):,} строк)...", flush=True)
         df_out.to_excel(writer, sheet_name='Обработанные данные', index=False)
         print(f"    ✓ Лист 'Обработанные данные' ({len(df_out):,} строк)")
 
         # Лист 2: Отрезки маршрута
         if not segments_df.empty:
+            print(f"    Записываю лист 'Отрезки маршрута' ({len(segments_df):,} строк)...", flush=True)
             segments_df.to_excel(writer, sheet_name='Отрезки маршрута', index=False)
             print(f"    ✓ Лист 'Отрезки маршрута' ({len(segments_df):,} отрезков)")
         else:
@@ -937,6 +1232,7 @@ def save_processed_data(df, output_folder, product2_dict=None):
 
         # Лист 3: Свод по кругам
         if not circle_event_schema_df.empty:
+            print(f"    Записываю лист 'Свод по кругам' ({len(circle_event_schema_df):,} строк)...", flush=True)
             circle_event_schema_df.to_excel(writer, sheet_name='Свод по кругам', index=False)
             print(f"    ✓ Лист 'Свод по кругам' ({len(circle_event_schema_df):,} строк)")
         else:
@@ -952,7 +1248,6 @@ def process_ktk_data():
     source_path = os.path.join(current_dir, "Источник", "выгрузка Истории КТК.xlsx")
     справочник_место_path = os.path.join(current_dir, "Справочники", "Справочник_место.xlsx")
     продукты_path = os.path.join(current_dir, "Справочники", "Продукты.xlsx")
-    операции_path = os.path.join(current_dir, "Справочники", "Операции.xlsx")
     отрезки_path = os.path.join(current_dir, "Справочники", "Отрезки.xlsx")
     схемы_path = os.path.join(current_dir, "Справочники", "Схемы.xlsx")
 
@@ -964,11 +1259,9 @@ def process_ktk_data():
     print("\n1. Загрузка справочников...")
     справочник_место = load_excel_safe(справочник_место_path)
     продукты = load_excel_safe(продукты_path)
-    операции = load_excel_safe(операции_path)
     отрезки = load_excel_safe(отрезки_path)
     if (справочник_место is None or
         продукты is None or
-        операции is None or
         отрезки is None):
         return None, None, {}
 
@@ -1076,46 +1369,47 @@ def process_ktk_data():
             all_circles_list.append(circle)
 
     df = pd.concat(df_list, ignore_index=True)
+    circles_df = pd.DataFrame(all_circles_list)
 
     df['Первая точка'] = None
     df['Последняя точка'] = None
 
     circle_mask = df['Номер круга'].notna()
     if circle_mask.any():
-        circle_dates = df[circle_mask].groupby(['Номер КТК', 'Номер круга'])['Дата события'].agg(
-            ['min', 'max']).reset_index()
-        df = df.merge(circle_dates, on=['Номер КТК', 'Номер круга'], how='left')
-        # "Первая точка" и "Последняя точка" теперь проставляются во всех строках круга
-        # (не только в строке с минимальной/максимальной датой)
-        df['Первая точка'] = np.where(circle_mask, df['min'].dt.strftime('%d.%m.%Y'), None)
-        df['Последняя точка'] = np.where(circle_mask, df['max'].dt.strftime('%d.%m.%Y'), None)
-        df = df.drop(columns=['min', 'max'])
+        boundary_lookup = _circle_boundary_lookup(circles_df)
+        # Завершённые круги используют точные границы из circles_df.
+        for row_idx in df.index[circle_mask]:
+            row = df.loc[row_idx]
+            key = _normalize_circle_key(row['Номер КТК'], row['Номер круга'])
+            if key not in boundary_lookup:
+                continue
+            start_date, end_date = boundary_lookup[key]
+            if pd.notna(start_date):
+                df.at[row_idx, 'Первая точка'] = start_date.strftime('%d.%m.%Y')
+            if pd.notna(end_date):
+                df.at[row_idx, 'Последняя точка'] = end_date.strftime('%d.%m.%Y')
 
-    circles_df = pd.DataFrame(all_circles_list)
+        # У незавершённого текущего круга нет конечной точки в Китае: показываем
+        # дату старта, а дату окончания оставляем пустой, не подменяя её последним событием.
+        completed_keys = set(boundary_lookup)
+        for (ktk, circle_num), idxs in df[circle_mask].groupby(['Номер КТК', 'Номер круга'], sort=False).groups.items():
+            key = _normalize_circle_key(ktk, circle_num)
+            if key in completed_keys:
+                continue
+            grp = df.loc[list(idxs)].sort_values('Дата события', kind='mergesort')
+            dates = pd.to_datetime(grp['Дата события'], errors='coerce').dropna()
+            if not dates.empty:
+                start_text = dates.iloc[0].strftime('%d.%m.%Y')
+                df.loc[list(idxs), 'Первая точка'] = start_text
+                df.loc[list(idxs), 'Последняя точка'] = None
+
 
     print("\n9. Присоединение продуктов из справочника...")
-    операции = clean_string_columns(
-        операции,
-        ['Тип движения', 'Состояние КТК', 'Вид транспорта']
-    )
+    # Операция больше не рассчитывается через внешний справочник.
+    # Оставляем колонку в выгрузке для совместимости со старыми шаблонами.
+    if 'Операция' not in df.columns:
+        df['Операция'] = None
 
-    operation_dict = dict(zip(
-        zip(
-        операции['Тип движения'],
-        операции['Состояние КТК'],
-        операции['Вид транспорта']
-        ),
-        операции['Операция']
-    ))
-
-    df['Операция'] = df.apply(
-        lambda r: operation_dict.get((
-            str(r['Тип движения']).strip(),
-            str(r['Состояние КТК']).strip(),
-            str(r['Вид транспорта']).strip()
-        )),
-        axis=1
-    )
     if 'Основной маршрут' in продукты.columns and 'Продукт' in продукты.columns:
         product_dict = dict(zip(продукты['Основной маршрут'].astype(str).str.strip(), продукты['Продукт']))
         if 'Основной маршрут' in df.columns:
@@ -1148,12 +1442,30 @@ def process_ktk_data():
     def extract_main_route_and_count(route):
         if pd.isna(route) or not route:
             return "не полный круг", 0
-        parts = route.split(' → ')
+
+        parts = [part.strip() for part in str(route).split(' → ') if part.strip()]
         china_indices = [i for i, part in enumerate(parts) if part == 'Китай']
-        if len(china_indices) < 2:
+        if not china_indices:
             return "не полный круг", 0
+
+        # Полные круги — маршруты между последовательными посещениями Китая,
+        # в которых есть хотя бы одна промежуточная локация.
+        circles_count = sum(
+            1 for i in range(len(china_indices) - 1)
+            if china_indices[i + 1] - china_indices[i] > 1
+        )
+
+        # Если после последнего Китая маршрут продолжается в другую локацию,
+        # считаем это начавшимся, но пока незавершённым кругом.
+        last_china_idx = china_indices[-1]
+        has_open_tail = any(part != 'Китай' for part in parts[last_china_idx + 1:])
+        if has_open_tail:
+            circles_count += 1
+
+        if len(china_indices) < 2:
+            return "не полный круг", circles_count
+
         main_route = ' → '.join(parts[china_indices[0]:china_indices[-1] + 1])
-        circles_count = sum(1 for i in range(len(china_indices) - 1) if china_indices[i + 1] - china_indices[i] > 1)
         return main_route, circles_count
 
     df[['Основной маршрут (общий)', 'Количество кругов']] = df['Маршрут следования'].apply(
@@ -1185,7 +1497,9 @@ def process_ktk_data():
     print("ОБРАБОТКА ЗАВЕРШЕНА")
     print("=" * 60)
     print(f"Обработано контейнеров: {df['Номер КТК'].nunique() if 'Номер КТК' in df.columns else 'Успешно'}")
-    print(f"Найдено кругов всего: {len(circles_df):,}")
+    print(f"Найдено завершённых кругов: {len(circles_df):,}")
+    if 'Номер круга' in df.columns:
+        print(f"Пронумеровано строк (включая незавершённый текущий круг): {df['Номер круга'].notna().sum():,}")
 
     return df, circles_df, product2_dict
 
@@ -1200,7 +1514,7 @@ if __name__ == "__main__":
             save_report(result_df, circles_df, output_folder)
 
             # Файл 2: Обработанные данные (один лист со всеми колонками)
-            save_processed_data(result_df, output_folder, product2_dict)
+            save_processed_data(result_df, output_folder, product2_dict, circles_df)
 
             print("\n✅ Оба файла успешно сформированы!")
         else:
