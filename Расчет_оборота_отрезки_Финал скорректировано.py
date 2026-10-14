@@ -955,7 +955,39 @@ def build_circle_event_schema(df, segment_dict, circle_date_range=None, product2
     if df.empty or 'Номер круга' not in df.columns:
         return pd.DataFrame()
 
-    circle_df = df[df['Номер круга'].notna()].copy()
+    # На лист «Свод по кругам» выводим только завершённые круги.
+    # Незавершённые круги остаются в «Обработанных данных», но не попадают в свод.
+    # Список завершённых границ берётся из circles_df, где записаны найденные
+    # пары «старт в Китае — возвращение в Китай». При этом исходный df не фильтруем:
+    # он нужен ниже для восстановления конечной точки в Китае, которая иногда
+    # одновременно становится началом следующего (незавершённого) круга.
+    all_circle_df = df[df['Номер круга'].notna()].copy()
+    if all_circle_df.empty:
+        return pd.DataFrame()
+
+    boundary_lookup = _circle_boundary_lookup(circles_df)
+    completed_circle_keys = {
+        key for key, (start_date, end_date) in boundary_lookup.items()
+        if pd.notna(start_date) and pd.notna(end_date)
+    }
+    if not completed_circle_keys:
+        print("    Для 'Свод по кругам' нет завершённых кругов; незавершённые исключены.", flush=True)
+        return pd.DataFrame()
+
+    row_circle_keys = [
+        _normalize_circle_key(ktk, circle_num)
+        for ktk, circle_num in zip(all_circle_df['Номер КТК'], all_circle_df['Номер круга'])
+    ]
+    completed_mask = [key in completed_circle_keys for key in row_circle_keys]
+    circle_df = all_circle_df.loc[completed_mask].copy()
+
+    all_circle_keys = {key for key in row_circle_keys if key is not None}
+    excluded_count = len(all_circle_keys - completed_circle_keys)
+    print(
+        f"    Для 'Свод по кругам': завершённых кругов {len(completed_circle_keys):,}; "
+        f"незавершённых исключено {excluded_count:,}.",
+        flush=True,
+    )
     if circle_df.empty:
         return pd.DataFrame()
 
