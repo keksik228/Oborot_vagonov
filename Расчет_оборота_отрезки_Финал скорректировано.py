@@ -3,6 +3,7 @@ import numpy as np
 from datetime import datetime
 import os
 import warnings
+import unicodedata
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 
@@ -31,6 +32,22 @@ def clean_string_columns(df, col_names):
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().replace('nan', None)
     return df
+
+
+def _normalize_place_key(value):
+    """Нормализует место для сопоставления: регистр, NBSP и повторяющиеся пробелы."""
+    if pd.isna(value):
+        return None
+    value = unicodedata.normalize('NFKC', str(value)).replace('\u00a0', ' ')
+    value = ' '.join(value.split()).casefold()
+    return value or None
+
+
+# Известные сокращённые варианты названий мест, которые встречались в выгрузках.
+# Точное совпадение со справочником всегда имеет приоритет над этим списком.
+PLACE_CLUSTER_ALIASES = {
+    'yujie shaanxi': 'Китай',
+}
 
 
 def _parse_circle_date(value):
@@ -1290,7 +1307,7 @@ def process_ktk_data():
         else:
             print("    ВНИМАНИЕ: В Схемы.xlsx должны быть колонки 'Схема движения по отрезкам' и 'Продукт 2'")
 
-    справочник_место = clean_string_columns(справочник_место, ['Место события'])
+    справочник_место = clean_string_columns(справочник_место, ['Место события', 'Кластер события'])
     справочник_место = справочник_место.drop_duplicates(subset=['Место события'], keep='first')
 
     print("\n2. Загрузка исходных данных...")
@@ -1317,10 +1334,52 @@ def process_ktk_data():
     print("\n5. Объединение со справочником мест...")
     if 'Место события' in справочник_место.columns and 'Кластер события' in справочник_место.columns:
         dict_places = справочник_место[['Место события', 'Кластер события']].copy()
-        dict_places = dict_places.rename(columns={'Кластер события': 'Локация'})
+        dict_places['_place_key'] = dict_places['Место события'].map(_normalize_place_key)
+        dict_places['Кластер события'] = dict_places['Кластер события'].astype(str).str.strip()
+        dict_places = dict_places[
+            dict_places['_place_key'].notna()
+            & dict_places['Кластер события'].notna()
+            & dict_places['Кластер события'].ne('')
+            & dict_places['Кластер события'].str.casefold().ne('nan')
+        ].drop_duplicates(subset=['_place_key'], keep='first')
+        place_lookup = dict(zip(dict_places['_place_key'], dict_places['Кластер события']))
+
+        # Дополнительные ключи для сокращённых названий, если они являются
+        # однозначным хвостом более полного названия из справочника.
+        # Если разные кластеры используют один хвост, такой алиас не применяется.
+        alias_clusters = {}
+        for full_key, cluster in place_lookup.items():
+            words = full_key.split()
+            for start in range(1, max(1, len(words) - 1)):
+                alias = ' '.join(words[start:])
+                if len(alias) >= 8 and len(alias.split()) >= 2:
+                    alias_clusters.setdefault(alias, set()).add(cluster)
+        place_alias_lookup = {
+            alias: next(iter(clusters))
+            for alias, clusters in alias_clusters.items()
+            if len(clusters) == 1
+        }
+        for alias, cluster in PLACE_CLUSTER_ALIASES.items():
+            place_alias_lookup.setdefault(_normalize_place_key(alias), cluster)
+
         if 'Локация' in df.columns:
             df = df.drop(columns=['Локация'])
-        df = df.merge(dict_places, on='Место события', how='left')
+        place_keys = df['Место события'].map(_normalize_place_key)
+        df['Локация'] = place_keys.map(place_lookup)
+        need_alias = df['Локация'].isna() & place_keys.notna()
+        df.loc[need_alias, 'Локация'] = place_keys.loc[need_alias].map(place_alias_lookup)
+
+        alias_count = int((need_alias & df['Локация'].notna()).sum())
+        print(f"    Совпадений со справочником мест: {(df['Локация'].notna().sum() - alias_count):,} строк")
+        if alias_count:
+            print(f"    Сопоставлено по однозначным вариантам названия места: {alias_count:,} строк")
+
+        unmapped = df.loc[df['Локация'].isna() & df['Место события'].notna(), 'Место события']
+        if not unmapped.empty:
+            missing_places = unmapped.value_counts().head(15)
+            print(f"    ВНИМАНИЕ: {unmapped.nunique():,} названий мест не сопоставлено со справочником. Примеры:")
+            for place, count in missing_places.items():
+                print(f"      - {place}: {count:,} строк")
     else:
         print("  ВНИМАНИЕ: Не найдены нужные колонки в справочнике мест!")
         df['Локация'] = 'Неизвестно'
@@ -1417,25 +1476,41 @@ def process_ktk_data():
         if not circles_df.empty and 'Основной маршрут' in circles_df.columns:
             circles_df['Продукт'] = circles_df['Основной маршрут'].map(product_dict)
 
-    print("\n10. Добавление общей проверки круга...")
+    print("\n10. Проверка только завершённых кругов...")
 
-    def check_complete_circle(grp):
-        china_events = grp[grp['Локация'] == 'Китай']['Дата события']
-        grp['Проверка круга'] = 'Не круг'
-        if len(china_events) >= 2 and china_events.min() != china_events.max():
-            if ((grp['Дата события'] > china_events.min()) & (grp['Дата события'] < china_events.max()) & (
-                    grp['Локация'] != 'Китай')).any():
-                grp['Проверка круга'] = 'Круг'
-        return grp
+    # В circles_df попадают только круги, у которых найдены обе границы:
+    # старт и возвращение в Китай. Номер открытого текущего круга может быть
+    # присвоен строкам df для маршрутизации, но он НЕ означает, что круг завершён.
+    # Раньше проверка запускалась на уровне всего контейнера: если у контейнера
+    # когда-либо был хотя бы один полный круг, все строки этого контейнера,
+    # включая незавершённый третий/четвёртый круг, получали признак "Круг".
+    # Теперь признак ставится отдельно по паре (Номер КТК, Номер круга),
+    # сопоставленной с реально найденными завершёнными кругами.
+    df['Проверка круга'] = 'Не круг'
+    completed_circle_keys = set()
+    if circles_df is not None and not circles_df.empty:
+        for _, circle_row in circles_df.iterrows():
+            if ('Является кругом' in circles_df.columns
+                    and not bool(circle_row.get('Является кругом', False))):
+                continue
+            circle_key = _normalize_circle_key(
+                circle_row.get('Номер КТК'), circle_row.get('Номер круга')
+            )
+            if circle_key is not None:
+                completed_circle_keys.add(circle_key)
 
-    # pandas новых версий убирает ключ groupby из колонок — обходим через список
-    df_list_10 = []
-    for ktk_val, grp in df.groupby('Номер КТК'):
-        result = check_complete_circle(grp)
-        if 'Номер КТК' not in result.columns:
-            result.insert(0, 'Номер КТК', ktk_val)
-        df_list_10.append(result)
-    df = pd.concat(df_list_10, ignore_index=True)
+    if completed_circle_keys and 'Номер круга' in df.columns and 'Номер КТК' in df.columns:
+        ktk_keys = df['Номер КТК'].astype(str).str.strip()
+        circle_numbers = pd.to_numeric(df['Номер круга'], errors='coerce')
+        row_keys = pd.MultiIndex.from_arrays([ktk_keys, circle_numbers])
+        completed_mask = row_keys.isin(completed_circle_keys)
+        df.loc[completed_mask, 'Проверка круга'] = 'Круг'
+
+    print(
+        f"    Завершённых кругов для проверки: {len(completed_circle_keys):,}; "
+        f"строк с признаком 'Круг': {(df['Проверка круга'] == 'Круг').sum():,}; "
+        f"строк 'Не круг': {(df['Проверка круга'] == 'Не круг').sum():,}"
+    )
 
     print("\n11-12. Расчёт маршрутов и количества кругов...")
 
