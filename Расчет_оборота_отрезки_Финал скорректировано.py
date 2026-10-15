@@ -27,6 +27,16 @@ def load_excel_safe(file_path, sheet_name=0):
         return None
 
 
+def _reference_file_path(current_dir, filename):
+    """Находит справочник в папке «Справочник» или «Справочники»."""
+    for folder_name in ("Справочник", "Справочники"):
+        candidate = os.path.join(current_dir, folder_name, filename)
+        if os.path.exists(candidate):
+            return candidate
+    # Возвращаем ожидаемый путь, чтобы сообщение об ошибке было понятным.
+    return os.path.join(current_dir, "Справочник", filename)
+
+
 def clean_string_columns(df, col_names):
     for col in col_names:
         if col in df.columns:
@@ -749,7 +759,10 @@ def build_circle_operations_summary(segments_df, segment_dict, circle_date_range
     df = segments_df.copy()
     print("    Сопоставляю 'Отрезок схемы' по справочнику...", flush=True)
     overload_series = df['Перегруз'] if 'Перегруз' in df.columns else pd.Series(None, index=df.index)
-    df['Отрезок схемы'] = map_segment_schemes(df['Отрезок'], overload_series, segment_dict)
+    direction_series = df['Учетное направление'] if 'Учетное направление' in df.columns else pd.Series(None, index=df.index)
+    df['Отрезок схемы'] = map_segment_schemes(
+        df['Отрезок'], overload_series, direction_series, segment_dict
+    )
     print("    Сопоставление отрезков завершено.", flush=True)
     df['Дней между локациями'] = pd.to_numeric(df['Дней между локациями'], errors='coerce').fillna(0)
     df['Дней в локации'] = pd.to_numeric(df['Дней в локации'], errors='coerce').fillna(0)
@@ -845,96 +858,150 @@ def _normalize_schema_key(value):
 
 
 def _normalize_overload(value):
-    """Нормализует признак перегруза для сопоставления со справочником.
-
-    В справочнике ожидаются значения 'Да' / 'Нет'. Пустое значение
-    означает, что для данного отрезка нет отдельного правила по перегрузу.
-    """
+    """Нормализует значение признака перегруза Да/Нет."""
     if pd.isna(value):
         return None
 
-    value = str(value).strip().lower()
+    value = unicodedata.normalize('NFKC', str(value)).replace('\u00a0', ' ')
+    value = ' '.join(value.split()).lower()
+    if value in {'', 'nan', 'none', '(пусто)', 'пусто'}:
+        return None
     if value in {'да', 'yes', 'true', '1'}:
-        return 'Да'
+        return 'да'
     if value in {'нет', 'no', 'false', '0'}:
-        return 'Нет'
-    return value.capitalize() if value else None
+        return 'нет'
+    return value
+
+
+def _normalize_segment_key(value):
+    """Нормализует значение перехода, не меняя смысл самого отрезка."""
+    if pd.isna(value):
+        return None
+    value = unicodedata.normalize('NFKC', str(value)).replace('\u00a0', ' ')
+    value = ' '.join(value.split())
+    if not value or value.casefold() in {'nan', 'none'}:
+        return None
+    if '→' in value:
+        value = ' → '.join(' '.join(part.split()) for part in value.split('→'))
+    return value.casefold()
+
+
+def _normalize_account_direction(value):
+    """Нормализует учетное направление. «(пусто)» означает пустое поле,
+    а не универсальное правило: оно совпадает только с пустым направлением в данных.
+    """
+    if pd.isna(value):
+        return None
+    value = unicodedata.normalize('NFKC', str(value)).replace('\u00a0', ' ')
+    value = ' '.join(value.split())
+    if not value or value.casefold() in {'nan', 'none', '(пусто)', 'пусто'}:
+        return None
+    return value.casefold()
+
+
+def _segment_reference_columns(segment_df):
+    """Возвращает реальные названия столбцов справочника (поддерживает старые заголовки)."""
+    if segment_df is None:
+        return None, None, None, None
+    segment_df.columns = segment_df.columns.astype(str).str.strip()
+
+    def pick(candidates):
+        return next((name for name in candidates if name in segment_df.columns), None)
+
+    segment_col = pick(('Следующий отрезок', 'Отрезок (сл. назначение)', 'Отрезок'))
+    overload_col = pick(('Перегруз',))
+    direction_col = pick(('Учетное направление', 'Учётное направление'))
+    scheme_col = pick(('Отрезок схемы', 'отрезок схемы', 'Схема участка'))
+    return segment_col, overload_col, direction_col, scheme_col
+
+
+def _missing_segment_reference_columns(segment_df):
+    segment_col, overload_col, direction_col, scheme_col = _segment_reference_columns(segment_df)
+    missing = []
+    if segment_col is None:
+        missing.append('Следующий отрезок')
+    if overload_col is None:
+        missing.append('Перегруз')
+    if direction_col is None:
+        missing.append('Учетное направление')
+    if scheme_col is None:
+        missing.append('Отрезок схемы')
+    return missing
 
 
 def build_segment_dict(segment_df):
-    """Строит два справочника для Отрезок схемы.
+    """Создает точный справочник соответствий по трем параметрам:
+    (Следующий отрезок, Перегруз, Учетное направление) -> Отрезок схемы.
 
-    1. Точное правило: (Отрезок, Перегруз) -> Отрезок схемы.
-    2. Общее правило: Отрезок -> Отрезок схемы для строк, где Перегруз не указан.
-
-    Важно: при наличии только правила с 'Да' или только с 'Нет' оно НЕ
-    применяется к противоположному значению перегруза. Это позволяет
-    постепенно заполнять справочник без неверных подстановок.
+    Универсального fallback нет: пока справочник заполняется, незаполненное
+    или отсутствующее правило оставляет «Отрезок схемы» пустым.
     """
-    exact = {}
-    generic = {}
+    segment_col, overload_col, direction_col, scheme_col = _segment_reference_columns(segment_df)
+    required = (segment_col, overload_col, direction_col, scheme_col)
+    if any(col is None for col in required):
+        missing = _missing_segment_reference_columns(segment_df)
+        print('    КРИТИЧЕСКАЯ ОШИБКА: в справочнике отрезков отсутствуют колонки: '
+              + ', '.join(missing))
+        return {'exact': {}}
 
+    exact = {}
+    conflicting_keys = 0
     for _, row in segment_df.iterrows():
-        segment = row.get('Отрезок (сл. назначение)')
-        scheme = row.get('отрезок схемы')
-        if pd.isna(segment) or pd.isna(scheme):
+        segment_key = _normalize_segment_key(row.get(segment_col))
+        scheme_value = row.get(scheme_col)
+        if segment_key is None or pd.isna(scheme_value):
+            continue
+        scheme_value = ' '.join(str(scheme_value).strip().split())
+        if not scheme_value or scheme_value.casefold() in {'nan', 'none'}:
             continue
 
-        segment = str(segment).strip()
-        scheme = str(scheme).strip()
-        overload = _normalize_overload(row.get('Перегруз')) if 'Перегруз' in segment_df.columns else None
+        overload_key = _normalize_overload(row.get(overload_col))
+        direction_key = _normalize_account_direction(row.get(direction_col))
+        key = (segment_key, overload_key, direction_key)
 
-        if overload is None:
-            # Общее правило применяется только когда в источнике перегруз не указан.
-            generic.setdefault(segment, scheme)
-        else:
-            exact[(segment, overload)] = scheme
+        if key in exact and exact[key] != scheme_value:
+            conflicting_keys += 1
+            continue
+        exact[key] = scheme_value
 
-    return {'exact': exact, 'generic': generic}
+    print(f"    Правил отрезков загружено: {len(exact):,}")
+    if conflicting_keys:
+        print(f"    ВНИМАНИЕ: конфликтующих повторных правил пропущено: {conflicting_keys:,}")
+    print("    Сопоставление использует: Следующий отрезок + Перегруз + Учетное направление.")
+    return {'exact': exact}
 
 
-def get_segment_scheme(segment, overload, segment_dict):
-    """Возвращает Отрезок схемы с учетом признака Перегруз."""
-    if pd.isna(segment):
+def get_segment_scheme(segment, overload, direction, segment_dict):
+    """Возвращает схему только при точном совпадении всех трех параметров."""
+    segment_key = _normalize_segment_key(segment)
+    if segment_key is None:
         return None
-
-    segment = str(segment).strip()
-    overload = _normalize_overload(overload)
-
-    exact = segment_dict.get('exact', {})
-    generic = segment_dict.get('generic', {})
-
-    if overload is not None and (segment, overload) in exact:
-        return exact[(segment, overload)]
-
-    # Если есть обычная строка без значения Перегруз, она может быть
-    # использована для любого перегруза как нейтральное правило.
-    if segment in generic:
-        return generic[segment]
-
-    # Не подменяем 'Да' на 'Нет' и наоборот. При неполном справочнике
-    # правильнее оставить значение пустым до его заполнения.
-    return None
-
-
-def map_segment_schemes(segment_series, overload_series, segment_dict):
-    """Быстро сопоставляет схемы отрезков по справочнику без DataFrame.apply(axis=1)."""
-    exact = segment_dict.get('exact', {})
-    generic = segment_dict.get('generic', {})
-    segments = segment_series.map(lambda value: str(value).strip() if pd.notna(value) else None)
-    overloads = overload_series.map(_normalize_overload)
-
-    # Короткий проход по парам ключей значительно дешевле создания Series на каждую строку.
-    mapped = pd.Series(
-        (exact.get((seg, ov)) if seg is not None and ov is not None else None
-         for seg, ov in zip(segments.tolist(), overloads.tolist())),
-        index=segment_series.index,
-        dtype='object'
+    key = (
+        segment_key,
+        _normalize_overload(overload),
+        _normalize_account_direction(direction),
     )
-    fallback_mask = mapped.isna() & segments.notna()
-    if fallback_mask.any():
-        mapped.loc[fallback_mask] = segments.loc[fallback_mask].map(generic)
-    return mapped
+    return segment_dict.get('exact', {}).get(key)
+
+
+def map_segment_schemes(segment_series, overload_series, direction_series, segment_dict):
+    """Векторизованное сопоставление схем по трем параметрам; без подстановок по догадке."""
+    if overload_series is None:
+        overload_series = pd.Series(None, index=segment_series.index)
+    if direction_series is None:
+        direction_series = pd.Series(None, index=segment_series.index)
+
+    segment_keys = segment_series.map(_normalize_segment_key).tolist()
+    overload_keys = overload_series.map(_normalize_overload).tolist()
+    direction_keys = direction_series.map(_normalize_account_direction).tolist()
+    exact = segment_dict.get('exact', {})
+
+    mapped_values = (
+        exact.get((segment_key, overload_key, direction_key)) if segment_key is not None else None
+        for segment_key, overload_key, direction_key
+        in zip(segment_keys, overload_keys, direction_keys)
+    )
+    return pd.Series(mapped_values, index=segment_series.index, dtype='object')
 
 
 def build_circle_event_schema(df, segment_dict, circle_date_range=None, product2_dict=None, circles_df=None):
@@ -1041,7 +1108,10 @@ def build_circle_event_schema(df, segment_dict, circle_date_range=None, product2
     # Автоматическое формирование названий "Межсервис <Локация>" отключено.
     print("    Сопоставляю 'Схема участка' для строк кругов...", flush=True)
     overload_series = circle_df['Перегруз'] if 'Перегруз' in circle_df.columns else pd.Series(None, index=circle_df.index)
-    circle_df['Схема участка'] = map_segment_schemes(circle_df['Отрезок'], overload_series, segment_dict)
+    direction_series = circle_df['Учетное направление'] if 'Учетное направление' in circle_df.columns else pd.Series(None, index=circle_df.index)
+    circle_df['Схема участка'] = map_segment_schemes(
+        circle_df['Отрезок'], overload_series, direction_series, segment_dict
+    )
     print("    'Схема участка' рассчитана.", flush=True)
 
     # № отрезка: растёт при смене пары (Схема участка, Отрезок) относительно предыдущей строки круга
@@ -1184,31 +1254,32 @@ def save_processed_data(df, output_folder, product2_dict=None, circles_df=None):
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
 
-    отрезки = load_excel_safe(
-        os.path.join(current_dir, "Справочники", "Отрезки.xlsx")
-    )
-
-    required_segment_cols = {'Отрезок (сл. назначение)', 'отрезок схемы'}
-    if not required_segment_cols.issubset(отрезки.columns):
-        print("    КРИТИЧЕСКАЯ ОШИБКА: В Отрезки.xlsx отсутствуют колонки 'Отрезок (сл. назначение)' и/или 'отрезок схемы'")
+    отрезки = load_excel_safe(_reference_file_path(current_dir, "Отрезки.xlsx"))
+    if отрезки is None:
+        print("    КРИТИЧЕСКАЯ ОШИБКА: не удалось загрузить справочник Отрезки.xlsx")
         return None, None, {}
 
+    missing_segment_cols = _missing_segment_reference_columns(отрезки)
+    if missing_segment_cols:
+        print("    КРИТИЧЕСКАЯ ОШИБКА: в Отрезки.xlsx отсутствуют колонки: "
+              + ', '.join(missing_segment_cols))
+        print("    Ожидаются параметры: Следующий отрезок, Перегруз, Учетное направление, Отрезок схемы.")
+        return None, None, {}
+
+    segment_col, overload_col, direction_col, scheme_col = _segment_reference_columns(отрезки)
     отрезки = clean_string_columns(
         отрезки,
-        ['Отрезок (сл. назначение)', 'Перегруз', 'отрезок схемы']
+        [segment_col, overload_col, direction_col, scheme_col]
     )
-
-    if 'Перегруз' not in отрезки.columns:
-        print("    ВНИМАНИЕ: В справочнике Отрезки.xlsx нет колонки 'Перегруз'. Используются только общие правила без учета перегруза.")
-    else:
-        print("    Справочник Отрезки: найден учет 'Перегруз'")
-
     segment_dict = build_segment_dict(отрезки)
 
-    df['Отрезок схемы'] = df.apply(
-        lambda r: get_segment_scheme(r['Отрезок'], r.get('Перегруз'), segment_dict),
-        axis=1
+    overload_series = df['Перегруз'] if 'Перегруз' in df.columns else pd.Series(None, index=df.index)
+    direction_series = df['Учетное направление'] if 'Учетное направление' in df.columns else pd.Series(None, index=df.index)
+    df['Отрезок схемы'] = map_segment_schemes(
+        df['Отрезок'], overload_series, direction_series, segment_dict
     )
+    matched_count = int(df['Отрезок схемы'].notna().sum())
+    print(f"    'Отрезок схемы' сопоставлен для {matched_count:,} строк; без совпадения осталось {len(df) - matched_count:,}.")
 
     # Точные даты границ берём из результатов поиска кругов. Нельзя рассчитывать
     # максимум только по строкам с одним Номером круга: конечное прибытие в Китай
@@ -1295,10 +1366,10 @@ def process_ktk_data():
     current_dir = os.path.dirname(os.path.abspath(__file__))
 
     source_path = os.path.join(current_dir, "Источник", "выгрузка Истории КТК.xlsx")
-    справочник_место_path = os.path.join(current_dir, "Справочники", "Справочник_место.xlsx")
-    продукты_path = os.path.join(current_dir, "Справочники", "Продукты.xlsx")
-    отрезки_path = os.path.join(current_dir, "Справочники", "Отрезки.xlsx")
-    схемы_path = os.path.join(current_dir, "Справочники", "Схемы.xlsx")
+    справочник_место_path = _reference_file_path(current_dir, "Справочник_место.xlsx")
+    продукты_path = _reference_file_path(current_dir, "Продукты.xlsx")
+    отрезки_path = _reference_file_path(current_dir, "Отрезки.xlsx")
+    схемы_path = _reference_file_path(current_dir, "Схемы.xlsx")
 
     print("=" * 60)
     print("НАЧАЛО ОБРАБОТКИ ДАННЫХ КТК")
@@ -1312,6 +1383,13 @@ def process_ktk_data():
     if (справочник_место is None or
         продукты is None or
         отрезки is None):
+        return None, None, {}
+
+    missing_segment_cols = _missing_segment_reference_columns(отрезки)
+    if missing_segment_cols:
+        print("    КРИТИЧЕСКАЯ ОШИБКА: в Отрезки.xlsx отсутствуют колонки: "
+              + ', '.join(missing_segment_cols))
+        print("    Ожидаются параметры: Следующий отрезок, Перегруз, Учетное направление, Отрезок схемы.")
         return None, None, {}
 
     print(f"    Справочник мест: {len(справочник_место)} записей")
