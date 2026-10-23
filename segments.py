@@ -509,10 +509,14 @@ def build_circle_event_schema(
 
     # Границы круга: для завершённых используем точные даты из circles_df.
     # Для незавершённых первая точка = первое событие круга, последняя точка =
-    # последнее известное событие в выгрузке. Время круга для них не рассчитываем.
+    # последнее известное событие в выгрузке. Дополнительно считаем «Время в движении»
+    # как количество календарных дней от первой до последней наблюдаемой точки.
     circle_df['Первая точка круга'] = None
     circle_df['Последняя точка круга'] = None
-    if not include_incomplete:
+    if include_incomplete:
+        circle_df['Последняя локация'] = None
+        circle_df['Время в движении'] = None
+    else:
         circle_df['Время круга'] = None
 
     for (ktk, circle_num), grp_idx in circle_df.groupby(['Номер КТК', 'Номер круга'], sort=False).groups.items():
@@ -527,12 +531,26 @@ def build_circle_event_schema(
             if pd.notna(start_date) and pd.notna(end_date):
                 circle_df.loc[grp_idx, 'Время круга'] = (end_date.normalize() - start_date.normalize()).days
         else:
-            group_dates = pd.to_datetime(
-                circle_df.loc[grp_idx, 'Дата события'], errors='coerce'
-            ).dropna()
+            group_rows = circle_df.loc[grp_idx].sort_values('Дата события', kind='mergesort')
+            group_dates = pd.to_datetime(group_rows['Дата события'], errors='coerce').dropna()
             if not group_dates.empty:
-                circle_df.loc[grp_idx, 'Первая точка круга'] = group_dates.min().strftime('%d.%m.%Y')
-                circle_df.loc[grp_idx, 'Последняя точка круга'] = group_dates.max().strftime('%d.%m.%Y')
+                start_date = group_dates.min()
+                end_date = group_dates.max()
+                circle_df.loc[grp_idx, 'Первая точка круга'] = start_date.strftime('%d.%m.%Y')
+                circle_df.loc[grp_idx, 'Последняя точка круга'] = end_date.strftime('%d.%m.%Y')
+                if include_incomplete:
+                    circle_df.loc[grp_idx, 'Время в движении'] = (
+                        end_date.normalize() - start_date.normalize()
+                    ).days
+
+            if include_incomplete and 'Локация' in group_rows.columns:
+                observed_locations = group_rows['Локация'].dropna()
+                if not observed_locations.empty:
+                    # Последняя локация определяется фактически последней точкой,
+                    # а не разбором текстовой строки «Основной маршрут».
+                    circle_df.loc[grp_idx, 'Последняя локация'] = str(
+                        observed_locations.iloc[-1]
+                    ).strip()
 
     # Схема движения по отрезкам: последовательность "Схема участка" по кругу.
     # Подряд идущие одинаковые операции схлопываются в одну,
@@ -568,10 +586,16 @@ def build_circle_event_schema(
 
     result_cols = [
         'Номер КТК', 'Номер круга', 'Основной маршрут',
-        'Первая точка круга', 'Последняя точка круга',
     ]
-    if not include_incomplete:
-        result_cols.append('Время круга')
+    if include_incomplete:
+        result_cols.extend([
+            'Последняя локация', 'Первая точка круга',
+            'Последняя точка круга', 'Время в движении',
+        ])
+    else:
+        result_cols.extend([
+            'Первая точка круга', 'Последняя точка круга', 'Время круга',
+        ])
     result_cols.extend([
         'Схема участка', '№ отрезка', 'Отрезок', 'Тип движения',
         'дата начала операции', 'дата окончания операции', 'Длительность операции',

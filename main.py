@@ -1,13 +1,14 @@
 """Точка входа в обработку данных контейнеров."""
+
 import warnings
 import traceback
 
 from config import OUTPUT_DIR
 from references import load_and_prepare_input
 from circles import process_circles_and_enrich
-from reports import save_report, save_processed_data
+from reports import save_processed_data
 
-warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 def main():
@@ -17,25 +18,42 @@ def main():
         print(f"Рабочая директория: {OUTPUT_DIR}")
         print("=" * 60)
 
-        df, original_columns, продукты, product2_dict = load_and_prepare_input()
+        # 1. Загружаем исходные данные и справочники
+        df, original_columns, продукты, product2_dict = (
+            load_and_prepare_input()
+        )
+
         if df is None or df.empty:
-            print("\n❌ Ошибка: Данные пусты или не были загружены.")
+            print("\n❌ Ошибка: данные пусты или не были загружены.")
             return
 
-        df, circles_df = process_circles_and_enrich(df, original_columns, продукты)
+        # 2. Находим круги и обогащаем данные
+        df, circles_df = process_circles_and_enrich(
+            df,
+            original_columns,
+            продукты,
+        )
 
-        # Файл 1: отчёт (группировка + свод + детализация).
-        report_path = save_report(df, circles_df, str(OUTPUT_DIR))
+        # 3. Формируем только файл «Обработанные данные»
+        # Отдельный файл «ОТЧЕТ_оборот_*.xlsx» не создаём.
+        processed_path = save_processed_data(
+            df,
+            str(OUTPUT_DIR),
+            product2_dict,
+            circles_df,
+        )
 
-        # Файл 2: обработанные данные, отрезки и свод по кругам.
-        processed_path = save_processed_data(df, str(OUTPUT_DIR), product2_dict, circles_df)
-
-        if report_path and processed_path:
-            print("\n✅ Оба файла успешно сформированы!")
+        if processed_path:
+            print("\n✅ Обработанные данные успешно сохранены!")
+            print(f"Файл: {processed_path}")
         else:
-            print("\n⚠️ Обработка завершилась не полностью: один из файлов не был сохранён.")
+            print(
+                "\n❌ Не удалось сохранить файл "
+                "обработанных данных."
+            )
+
     except Exception as exc:
-        print(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА ВЫПОЛНЕНИЯ: {exc}")
+        print(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА: {exc}")
         traceback.print_exc()
 
     input("\nНажмите Enter для выхода из программы...")
